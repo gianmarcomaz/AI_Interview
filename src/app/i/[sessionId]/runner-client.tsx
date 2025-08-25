@@ -1,20 +1,36 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback, useTransition } from 'react';
+import { useEffect, useRef, useState, useCallback, useTransition, lazy, Suspense, useMemo } from 'react';
 import { useSearchParams, useParams } from 'next/navigation';
 import { useSession } from '@/lib/store/session';
 import { startSTT } from '@/lib/stt/webspeech';
 import { startVAD } from '@/lib/audio/vad';
+
 import ControlsBar from '@/components/ControlsBar';
 import AgentPane from '@/components/AgentPane';
 import TranscriptPane from '@/components/TranscriptPane';
 import DeviceCheck from '@/components/DeviceCheck';
-import VideoPublisher from '@/components/VideoPublisher';
 import { inc, addSessionMinutes } from '@/lib/metrics/local';
 import { loadCampaignQuestions } from '@/lib/store/session';
 import { InterviewService } from '@/lib/firebase/interview';
 import { CreateInterviewSessionData, AddTranscriptSegmentData, AddQuestionData } from '@/types/interview';
 import { generateInsight, generateFinalSummary } from '@/lib/orchestrator/insight';
+
+// Lazy load video components for better performance
+const VideoPublisher = lazy(() => import('@/components/VideoPublisher'));
+const VideoViewer = lazy(() => import('@/components/VideoViewer'));
+
+// Simple debounce utility function
+function debounce<T extends (...args: any[]) => any>(
+  func: T,
+  wait: number
+): (...args: Parameters<T>) => void {
+  let timeout: NodeJS.Timeout;
+  return (...args: Parameters<T>) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func(...args), wait);
+  };
+}
 
 export default function InterviewClient() {
   const params = useParams<{ sessionId: string }>();
@@ -23,6 +39,7 @@ export default function InterviewClient() {
 
   // Safely derive URL params once
   const campaignParam = searchParams?.get('c') ?? null;
+  const modeParam = searchParams?.get('m') ?? null; // FIXED: Read mode from URL
 
   // Session store (Day-2 shape uses `mode`/`setMode` for LLM mode)
   const setCampaign = useSession(s => s.setCampaign);
@@ -42,6 +59,7 @@ export default function InterviewClient() {
   const setInsight = useSession(s => s.setInsight);
   const setFinalSummary = useSession(s => s.setFinalSummary);
   const mode = useSession(s => s.mode);
+  const setMode = useSession(s => s.setMode); // FIXED: Add setMode selector
   const enqueueFollowup = useSession(s => s.enqueueFollowup);
   const storeCurrentQ = useSession(s => s.currentQ);
 
@@ -57,6 +75,267 @@ export default function InterviewClient() {
     } catch {}
   }, []);
 
+  // FIXED: Set mode from URL parameter on mount
+  useEffect(() => {
+    if (modeParam && (modeParam === 'structured' || modeParam === 'conversational')) {
+      setMode(modeParam);
+      console.log('🔄 Set interview mode from URL:', modeParam);
+    }
+  }, [modeParam, setMode]);
+
+  // Helper function to check TTS availability and permissions
+  const checkTTSAvailability = useCallback(() => {
+    if (!('speechSynthesis' in window)) {
+      return { available: false, reason: 'Speech synthesis not supported in this browser' };
+    }
+    
+    try {
+      // Test if we can create an utterance
+      const testUtterance = new SpeechSynthesisUtterance('');
+      if (!testUtterance) {
+        return { available: false, reason: 'Cannot create speech utterance' };
+      }
+      
+      // Check if voices are available
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length === 0) {
+        // Try to load voices
+        window.speechSynthesis.onvoiceschanged = () => {
+          console.log('🎤 TTS voices loaded:', window.speechSynthesis.getVoices().length);
+        };
+        return { available: true, reason: 'TTS available but voices still loading' };
+      }
+      
+      return { available: true, reason: 'TTS fully available' };
+    } catch (error) {
+      return { available: false, reason: `TTS test failed: ${error}` };
+    }
+  }, []);
+
+  // Optimized question speaking with debouncing
+  const speakQuestion = useCallback(async (questionText: string) => {
+    if (!questionText?.trim()) {
+      console.warn('⚠️ No question text to speak');
+      return;
+    }
+
+    // Check TTS availability first
+    const ttsStatus = checkTTSAvailability();
+    if (!ttsStatus.available) {
+      console.warn(`⚠️ TTS not available: ${ttsStatus.reason}`);
+      // Show user-friendly message about TTS being unavailable
+      return;
+    }
+
+    try {
+      // Stop any current speech gracefully
+      if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.cancel();
+        // Small delay to ensure clean stop
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      // Wait for brief silence before speaking to avoid talk-over
+      await waitForSilence(600);
+      
+      // Attempt to speak the question
+      await speakQuestionInternal(questionText);
+    } catch (error) {
+      console.error('❌ Failed to speak question:', error);
+      // Don't throw - just log the error and continue
+    }
+  }, [checkTTSAvailability]);
+
+  // Internal TTS function with proper error handling and barge-in rules
+  const speakQuestionInternal = async (questionText: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      try {
+        const utterance = new SpeechSynthesisUtterance(questionText);
+        
+        // Configure voice settings for consistency
+        configureTTSVoice(utterance);
+        
+        // Configure speech parameters for clear interview questions
+        utterance.rate = 0.9; // Slightly slower for clarity
+        utterance.pitch = 1.0;
+        utterance.volume = 1.0;
+        
+        // Barge-in rules: stop STT when TTS starts, resume when it ends
+        utterance.onstart = () => {
+          console.log('🎤 AI speaking question:', questionText.substring(0, 50) + '...');
+          // Stop STT to prevent double-talk
+          if (stopRef.current) {
+            console.log('🔇 Stopping STT for TTS (barge-in rule)');
+            stopRef.current();
+            stopRef.current = null;
+          }
+        };
+        
+        utterance.onend = () => {
+          console.log('✅ AI finished speaking question');
+          // Resume STT listening after a short delay to ensure clean transition
+          setTimeout(() => {
+            if (!stopRef.current) {
+              console.log('🎤 Resuming STT after TTS (barge-in rule)');
+              startMic();
+            }
+          }, 300);
+          resolve(); // Resolve the promise when speech ends
+        };
+        
+        utterance.onerror = (event) => {
+          // Handle different error types gracefully
+          let errorMessage = 'Unknown TTS error';
+          let shouldResumeSTT = true;
+          
+          switch (event.error) {
+            case 'interrupted':
+              console.log('ℹ️ Speech was interrupted (this is normal when navigating quickly)');
+              errorMessage = 'Speech interrupted';
+              break;
+            case 'canceled':
+              console.log('ℹ️ Speech was canceled (this is normal when stopping)');
+              errorMessage = 'Speech canceled';
+              break;
+            case 'not-allowed':
+              console.warn('⚠️ Speech not allowed - this may be due to browser settings or permissions');
+              errorMessage = 'Speech not allowed - check browser settings';
+              shouldResumeSTT = false; // Don't resume STT if TTS is blocked
+              break;
+            case 'network':
+              console.warn('⚠️ Network error during speech synthesis');
+              errorMessage = 'Network error during speech';
+              break;
+            case 'audio-busy':
+              console.warn('⚠️ Audio system is busy');
+              errorMessage = 'Audio system busy';
+              break;
+            default:
+              console.warn('⚠️ TTS Error:', event.error);
+              errorMessage = `TTS Error: ${event.error}`;
+          }
+          
+          // Log the error for debugging
+          console.warn(`TTS Error (${event.error}): ${errorMessage}`);
+          
+          // Resume STT on error after a delay (if appropriate)
+          if (shouldResumeSTT) {
+            setTimeout(() => {
+              if (!stopRef.current) {
+                console.log('🎤 Resuming STT after TTS error (barge-in rule)');
+                startMic();
+              }
+            }, 200);
+          }
+          
+          // Resolve the promise even on error (don't reject)
+          resolve();
+        };
+        
+        // Set a timeout to prevent hanging if TTS never starts
+        const ttsTimeout = setTimeout(() => {
+          console.warn('⚠️ TTS timeout - speech did not start within 5 seconds');
+          window.speechSynthesis.cancel();
+          resolve(); // Resolve to prevent hanging
+        }, 5000);
+        
+        // Clear timeout when speech starts
+        utterance.onstart = () => {
+          clearTimeout(ttsTimeout);
+          console.log('🎤 AI speaking question:', questionText.substring(0, 50) + '...');
+          // Stop STT to prevent double-talk
+          if (stopRef.current) {
+            console.log('🔇 Stopping STT for TTS (barge-in rule)');
+            stopRef.current();
+            stopRef.current = null;
+          }
+        };
+        
+        // Speak the question
+        try {
+          window.speechSynthesis.speak(utterance);
+        } catch (error) {
+          console.error('❌ Error starting speech synthesis:', error);
+          clearTimeout(ttsTimeout);
+          resolve(); // Resolve to prevent hanging
+        }
+        
+      } catch (error) {
+        console.error('❌ Error setting up TTS:', error);
+        // Resume STT on error after a delay
+        setTimeout(() => {
+          if (!stopRef.current) {
+            console.log('🎤 Resuming STT after TTS setup error (barge-in rule)');
+            startMic();
+          }
+        }, 200);
+        resolve(); // Resolve to prevent hanging
+      }
+    });
+  };
+
+  // FIXED: Conversational mode seeding - ensure AI follow-ups are generated
+  useEffect(() => {
+    if (mode !== 'conversational') return;
+    
+    console.log('🌱 Initializing conversational mode...');
+    
+    // Clear any existing follow-ups when switching to conversational mode
+    useSession.getState().clearFollowups();
+    
+    // Seed initial question for conversational mode
+    const seed = 'Give me a 30-second overview of your background and experience.';
+    
+    // FIXED: Set the initial question in the session store to start progress at 1
+    const session = useSession.getState();
+    if (session.qIndex === 0) {
+      session.setInitialQuestion({
+        id: 'conversational-seed',
+        text: seed,
+        topic: 'behavioral',
+        difficulty: 1
+      });
+      
+      // Also enqueue this as the first follow-up
+      enqueueFollowup(seed as any);
+      console.log('🌱 Seeded initial conversational question:', seed);
+    }
+  }, [mode, enqueueFollowup]);
+
+  // FIXED: Remove the duplicate mode reset effect that was causing issues
+  // useEffect(() => {
+  //   if (mode === 'conversational') {
+  //     // Clear any existing questions and start fresh
+  //     useSession.getState().clearFollowups();
+  //     // Seed with initial question
+  //     const seed = Math.random() < 0.5
+  //       ? 'Give me a 30-second overview of your background and experience.'
+  //       : 'What recent project are you most proud of, and why?';
+  //     enqueueFollowup(seed as any);
+  //   }
+  // }, [mode, enqueueFollowup]);
+
+  // Speak the seed once it exists before STT is listening
+  useEffect(() => {
+    if (mode !== 'conversational') return;
+    if (storeCurrentQ?.text && !started) {
+      speakQuestion(storeCurrentQ.text);
+    }
+  }, [mode, storeCurrentQ?.text, started, speakQuestion]);
+
+  // Reset conversational mode when switching modes
+  useEffect(() => {
+    if (mode === 'conversational') {
+      // Clear any existing questions and start fresh
+      useSession.getState().clearFollowups();
+      // Seed with initial question
+      const seed = Math.random() < 0.5
+        ? 'Give me a 30-second overview of your background and experience.'
+        : 'What recent project are you most proud of, and why?';
+      enqueueFollowup(seed as any);
+    }
+  }, [mode, enqueueFollowup]);
+
   const [partial, setPartialLocal] = useState('');
   const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
   const lastSavedPartialRef = useRef<string>(''); // Track last saved partial to prevent duplicates
@@ -69,7 +348,9 @@ export default function InterviewClient() {
   const [firebaseSessionId, setFirebaseSessionId] = useState<string | null>(null);
   const [deviceReady, setDeviceReady] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
-
+  const [videoEnabled, setVideoEnabled] = useState(false); // Control video component loading
+  const [isLoading, setIsLoading] = useState(false); // Loading state for operations
+  
   // Transition to keep UI responsive on button clicks
   const [, startTransition] = useTransition();
   const [clickBusy, setClickBusy] = useState(false);
@@ -84,8 +365,11 @@ export default function InterviewClient() {
   const lastSpeechAtRef = useRef<number>(0);
   const vadStopRef = useRef<(() => void) | null>(null);
   
-  // AI insight generation
-  const runInsight = async (answer: string) => {
+  // Debug flag to reduce logging in production
+  const isDebug = process.env.NODE_ENV === 'development';
+  
+  // AI insight generation with optimized performance
+  const runInsight = useCallback(async (answer: string) => {
     if (!answer.trim()) return;
     
     const snippet = answer.slice(-400);
@@ -104,24 +388,49 @@ export default function InterviewClient() {
         tokenBudgetLeft
       });
 
-      addTokens(usedTokens);
+      // FIXED: Update tokens immediately and ensure UI reflects changes
+      if (usedTokens > 0) {
+        addTokens(usedTokens);
+        console.log('💾 Tokens updated:', usedTokens, 'Total:', tokensUsed + usedTokens);
+      }
+      
       setInsight(json, latency);
       
-      // Enqueue AI follow-up if in conversational mode and insight provides one
-      if (mode === 'conversational' && json.followup) {
+      // FIXED: Ensure AI follow-up is properly enqueued for conversational mode
+      if (mode === 'conversational' && json.followup && json.followup.trim().length > 0) {
         enqueueFollowup(json.followup);
+        if (isDebug) console.log('🤖 AI follow-up enqueued:', json.followup);
+        
+        // Also log the current follow-up queue for debugging
+        const currentQueue = useSession.getState().followupQueue;
+        console.log('📋 Current follow-up queue length:', currentQueue.length);
+        
+        // FIXED: Immediately update the current question to show the AI-generated follow-up
+        const session = useSession.getState();
+        if (session.currentQ.text !== json.followup) {
+          session.setInitialQuestion({
+            id: `ai-followup-${Date.now()}`,
+            text: json.followup,
+            topic: 'behavioral',
+            difficulty: 2
+          });
+          console.log('🔄 Updated current question to AI follow-up:', json.followup);
+        }
       }
     } catch (error) {
-      console.error('Failed to generate insight:', error);
+      if (isDebug) console.error('Failed to generate insight:', error);
     }
-  };
+  }, [llmMode, softCap, tokensUsed, rollingSummary, mode, enqueueFollowup, addTokens, setInsight, isDebug, params]);
 
   // Final session summary generation
   const generateFinalSummaryAndNavigate = async () => {
     try {
       const sess = String((params as any)?.sessionId || "");
       if (!transcript?.length) {
-        alert('No transcript to summarize');
+        console.warn("No local transcript, fetching from server...");
+        // Navigate to reports page where transcripts will be loaded from Firebase
+        const reportUrl = `/reports/${sess}${campaignParam ? `?c=${campaignParam}` : ''}`;
+        window.location.href = reportUrl;
         return;
       }
       const transcriptData = transcript.map(t => ({ 
@@ -155,20 +464,41 @@ export default function InterviewClient() {
 
   // Helper function to configure TTS with consistent voice settings
   const configureTTSVoice = (utterance: SpeechSynthesisUtterance) => {
-    // Get the selected TTS voice from the session store
-    const { ttsVoice } = useSession.getState();
-    
-    if (ttsVoice && ttsVoice !== 'default') {
-      // Find the specific voice
-      const voices = window.speechSynthesis.getVoices();
-      const selectedVoice = voices.find(v => v.voiceURI === ttsVoice);
-      if (selectedVoice) {
-        utterance.voice = selectedVoice;
-        console.log('🎤 Using selected TTS voice:', selectedVoice.name);
-        return true; // Voice was set
+    try {
+      // Get the selected TTS voice from the session store
+      const { ttsVoice } = useSession.getState();
+      
+      if (ttsVoice && ttsVoice !== 'default') {
+        // Find the specific voice
+        const voices = window.speechSynthesis.getVoices();
+        const selectedVoice = voices.find(v => v.voiceURI === ttsVoice);
+        if (selectedVoice) {
+          utterance.voice = selectedVoice;
+          console.log('🎤 Using selected TTS voice:', selectedVoice.name);
+          return true; // Voice was set
+        }
       }
+      
+      // Fallback to default voice
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        // Try to find a good default voice (prefer English, female voices)
+        const defaultVoice = voices.find(v => 
+          v.lang.startsWith('en') && v.name.toLowerCase().includes('female')
+        ) || voices.find(v => v.lang.startsWith('en')) || voices[0];
+        
+        if (defaultVoice) {
+          utterance.voice = defaultVoice;
+          console.log('🎤 Using default TTS voice:', defaultVoice.name);
+          return true;
+        }
+      }
+      
+      return false; // Using system default voice
+    } catch (error) {
+      console.warn('⚠️ Error configuring TTS voice:', error);
+      return false; // Fall back to system default
     }
-    return false; // Using default voice
   };
 
   // --- Manual+ Half-duplex primitives ---
@@ -198,10 +528,12 @@ export default function InterviewClient() {
   const speakAck = async () => { await beep(100, 660); };
 
   const autoNext = () => {
-    // Only auto-advance if we're not at the last question
-    if (currentQuestionIndex < totalQuestions - 1) {
+    // Only auto-advance if we're in structured mode and not at the last question
+    if (mode === 'structured' && currentQuestionIndex < memoizedTotalQuestions - 1) {
       console.log('🤖 Auto-advancing to next question...');
       nextQuestion();
+    } else if (mode === 'conversational') {
+      console.log('💬 Conversational mode - no auto-advance, waiting for AI follow-up');
     } else {
       console.log('🎉 Interview completed, no more questions to advance to');
     }
@@ -212,7 +544,7 @@ export default function InterviewClient() {
     const now = performance.now();
     const spokeLongEnough = (now - turnStartedAtRef.current) > MIN_SPEECH_MS;
     const withinSoft = (now - turnStartedAtRef.current) < SOFT_MS;
-    if (spokeLongEnough && currentQuestionIndex < totalQuestions - 1) {
+    if (spokeLongEnough && currentQuestionIndex < memoizedTotalQuestions - 1) {
       const AUTO = false; // stays opt-in
       if (!AUTO) return;
       speakAck();
@@ -236,6 +568,23 @@ export default function InterviewClient() {
 
   // Memoized current question getter (placed before handlers that depend on it)
   const getCurrentQuestion = useCallback(() => {
+    // For conversational mode, always use the session store's current question
+    if (mode === 'conversational') {
+      const sessionQ = useSession.getState().currentQ;
+      if (sessionQ?.text) {
+        console.log(`📝 Conversational mode - Current question:`, sessionQ.text.substring(0, 50) + '...');
+        return sessionQ;
+      }
+      // FIXED: For conversational mode, never fall back to structured questions
+      // Return a default seed question instead
+      return {
+        id: 'conversational-default',
+        text: 'Give me a 30-second overview of your background and experience.',
+        category: 'behavioral'
+      };
+    }
+
+    // For structured mode, use campaign questions or default questions
     const localTotalQuestions = campaignQuestions.length > 0 ? campaignQuestions.length : 8;
     if (campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length) {
       const question = campaignQuestions[currentQuestionIndex];
@@ -243,31 +592,31 @@ export default function InterviewClient() {
         ...question,
         category: question.category || 'behavioral'
       };
-      console.log(`📝 Current question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, questionWithCategory);
+      console.log(`📝 Structured mode - Campaign question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, questionWithCategory);
       return questionWithCategory;
     }
+    
+    // Default questions for structured mode
+    const defaultQuestions = [
+      'Give me a 30-second overview of your background and experience.',
+      'How would you keep p95 <1s in a live STT to summary pipeline?',
+      'Describe a challenging project you worked on and how you overcame obstacles.',
+      'Where do you see yourself professionally in the next 3-5 years?',
+      'What motivates you to do your best work?',
+      'Tell me about a time you had to learn something new quickly.',
+      'How do you handle feedback and criticism?',
+      'What questions do you have for me about this role or company?'
+    ];
+    
     const defaultQuestion = {
       id: `default-${currentQuestionIndex + 1}`,
-      text: currentQuestionIndex === 0 
-        ? 'Give me a 30-second overview of your background and experience.'
-        : currentQuestionIndex === 1
-        ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
-        : currentQuestionIndex === 2
-        ? 'Describe a challenging project you worked on and how you overcame obstacles.'
-        : currentQuestionIndex === 3
-        ? 'Where do you see yourself professionally in the next 3-5 years?'
-        : currentQuestionIndex === 4
-        ? 'What motivates you to do your best work?'
-        : currentQuestionIndex === 5
-        ? 'Tell me about a time you had to learn something new quickly.'
-        : currentQuestionIndex === 6
-        ? 'How do you handle feedback and criticism?'
-        : 'What questions do you have for me about this role or company?',
+      text: defaultQuestions[currentQuestionIndex] || defaultQuestions[defaultQuestions.length - 1],
       category: 'behavioral'
-    } as const;
-    console.log(`📝 Using default question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, defaultQuestion);
+    };
+    
+    console.log(`📝 Structured mode - Default question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, defaultQuestion);
     return defaultQuestion;
-  }, [campaignQuestions, currentQuestionIndex]);
+  }, [campaignQuestions, currentQuestionIndex, mode]);
 
   // Initialize campaign + load saved campaign settings (lang, ttsVoice, questions)
   useEffect(() => {
@@ -286,12 +635,32 @@ export default function InterviewClient() {
           const parsed = JSON.parse(raw);
           if (parsed.sttLanguage) setLang(parsed.sttLanguage);
           if (parsed.ttsVoice) setTtsVoice(parsed.ttsVoice);
+          // FIXED: Load saved mode selection
+          if (parsed.interviewMode && (parsed.interviewMode === 'structured' || parsed.interviewMode === 'conversational')) {
+            useSession.getState().setMode(parsed.interviewMode);
+            console.log('🔄 Restored saved interview mode:', parsed.interviewMode);
+          }
         }
       } catch (e) {
         console.warn('Failed to load campaign settings for session:', e);
       }
     }
   }, [campaignParam, setCampaign, setLang, setTtsVoice]);
+
+  // FIXED: Save mode selection whenever it changes
+  useEffect(() => {
+    if (campaignParam && mode) {
+      try {
+        const existingSettings = localStorage.getItem(`campaign-settings-${campaignParam}`);
+        const settings = existingSettings ? JSON.parse(existingSettings) : {};
+        settings.interviewMode = mode;
+        localStorage.setItem(`campaign-settings-${campaignParam}`, JSON.stringify(settings));
+        console.log('💾 Saved interview mode:', mode);
+      } catch (e) {
+        console.warn('Failed to save interview mode:', e);
+      }
+    }
+  }, [campaignParam, mode]);
 
   // Create Firebase session when component mounts (only once)
   useEffect(() => {
@@ -325,8 +694,75 @@ export default function InterviewClient() {
     }
   }, []);
 
-  const createFirebaseSession = async () => {
+  // Memoized values to prevent unnecessary re-renders
+  const memoizedTotalQuestions = useMemo(() => 
+    campaignQuestions.length > 0 ? campaignQuestions.length : 8, 
+    [campaignQuestions.length]
+  );
+  
+  // FIXED: Proper progress tracking for conversational mode
+  const memoizedCompletedQuestions = useMemo(() => {
+    if (mode === 'conversational') {
+      // For conversational mode, count based on session store's qIndex
+      const sessionQIndex = useSession.getState().qIndex;
+      // FIXED: Ensure we always show at least 1 when there's a current question
+      const baseCount = Math.max(1, sessionQIndex);
+      return Math.min(baseCount, 8); // Cap at 8 for conversational mode
+    } else {
+      // For structured mode, use current question index
+      return currentQuestionIndex >= memoizedTotalQuestions - 1 ? memoizedTotalQuestions : currentQuestionIndex + 1;
+    }
+  }, [currentQuestionIndex, memoizedTotalQuestions, mode, storeCurrentQ?.text]); // FIXED: Add storeCurrentQ dependency
+
+  const memoizedIsInterviewCompleted = useMemo(() => {
+    if (mode === 'conversational') {
+      // For conversational mode, check if session is finished or we've reached max questions
+      const sessionQIndex = useSession.getState().qIndex;
+      return sessionQIndex >= 8 || useSession.getState().finished;
+    } else {
+      // For structured mode, check question index
+      return currentQuestionIndex >= memoizedTotalQuestions - 1;
+    }
+  }, [currentQuestionIndex, memoizedTotalQuestions, mode, storeCurrentQ?.text]); // FIXED: Add storeCurrentQ dependency
+
+  // Memoized current question to prevent unnecessary recalculations
+  const currentQuestion = useMemo(() => {
+    if (mode === 'conversational') {
+      // For conversational mode, always use the session store's current question
+      const sessionQ = useSession.getState().currentQ;
+      if (sessionQ?.text) {
+        console.log(`📝 Conversational mode - Current question:`, sessionQ.text.substring(0, 50) + '...');
+        return sessionQ;
+      }
+      // FIXED: For conversational mode, never fall back to structured questions
+      // Return a default seed question instead
+      return {
+        id: 'conversational-default',
+        text: 'Give me a 30-second overview of your background and experience.',
+        category: 'behavioral'
+      };
+    } else {
+      // For structured mode, use the existing logic
+      return getCurrentQuestion();
+    }
+  }, [mode, getCurrentQuestion]);
+
+  // Memoized mode-dependent values
+  const isConversationalMode = useMemo(() => mode === 'conversational', [mode]);
+  const canGoNext = useMemo(() => 
+    isConversationalMode ? true : currentQuestionIndex < memoizedTotalQuestions - 1, 
+    [isConversationalMode, currentQuestionIndex, memoizedTotalQuestions]
+  );
+  const canGoPrevious = useMemo(() => 
+    isConversationalMode ? false : currentQuestionIndex > 0, 
+    [isConversationalMode, currentQuestionIndex]
+  );
+
+  // Optimized Firebase session creation with better error handling
+  const createFirebaseSession = useCallback(async () => {
     try {
+      setIsLoading(true);
+      
       // Check if we already have a session
       if (firebaseSessionId) {
         console.log('⚠️ Session already exists, not creating new one');
@@ -391,8 +827,10 @@ export default function InterviewClient() {
       console.error('❌ Failed to create Firebase session:', error);
       setFirebaseSessionId(null);
       throw error; // Re-throw so startMic can handle it
+    } finally {
+      setIsLoading(false);
     }
-  };
+  }, [campaignParam, firebaseSessionId]);
 
   const startMic = async () => {
     if (stopRef.current) {
@@ -403,40 +841,42 @@ export default function InterviewClient() {
     
     // Clear any previous errors when starting
     setSttError(null);
-    // Do not show any start-over confirmation here; this function is used for
-    // routine TTS↔STT handoffs during a session. A brand-new session is created
-    // automatically if firebaseSessionId is null (handled below).
-    
-    // CRITICAL FIX: Get the current session ID and ensure it's available
-    let currentSessionId = firebaseSessionId;
-    if (!currentSessionId) {
-      try {
-        console.log('🆕 Creating new Firebase session...');
-        currentSessionId = await createFirebaseSession();
-        console.log('✅ Session created with ID:', currentSessionId);
-      } catch (error) {
-        console.error('❌ Failed to create new session for interview:', error);
-        return; // Don't start if session creation fails
-      }
-    }
-    
-    console.log('🎤 Starting STT with session ID:', currentSessionId);
-    
-    // Track metrics
-    if (campaignParam) {
-      inc(campaignParam, "responses", 1);
-      sessionStartRef.current = Date.now();
-    }
-
-    // Update Firebase session status to in_progress
-    if (currentSessionId) {
-      InterviewService.updateSessionStatus(currentSessionId, {
-        status: 'in_progress',
-        startedAt: new Date().toISOString()
-      });
-    }
+    setIsLoading(true);
     
     try {
+      // Do not show any start-over confirmation here; this function is used for
+      // routine TTS↔STT handoffs during a session. A brand-new session is created
+      // automatically if firebaseSessionId is null (handled below).
+      
+      // CRITICAL FIX: Get the current session ID and ensure it's available
+      let currentSessionId = firebaseSessionId;
+      if (!currentSessionId) {
+        try {
+          console.log('🆕 Creating new Firebase session...');
+          currentSessionId = await createFirebaseSession();
+          console.log('✅ Session created with ID:', currentSessionId);
+        } catch (error) {
+          console.error('❌ Failed to create new session for interview:', error);
+          return; // Don't start if session creation fails
+        }
+      }
+      
+      console.log('🎤 Starting STT with session ID:', currentSessionId);
+      
+      // Track metrics
+      if (campaignParam) {
+        inc(campaignParam, "responses", 1);
+        sessionStartRef.current = Date.now();
+      }
+
+      // Update Firebase session status to in_progress
+      if (currentSessionId) {
+        InterviewService.updateSessionStatus(currentSessionId, {
+          status: 'in_progress',
+          startedAt: new Date().toISOString()
+        });
+      }
+      
       // Start VAD for better speech detection
       if (currentSessionId) {
         try {
@@ -463,12 +903,13 @@ export default function InterviewClient() {
             },
             onSilence: () => { 
               console.log('🔇 VAD: Silence detected');
-              // VAD silence triggers STT idle timer, which will handle finalization
+              // FIXED: Don't stop STT on VAD silence - let STT handle its own timing
+              // VAD silence should not interfere with STT operation
             }
           }, { 
             energyThreshold: 0.015,
             minSpeechMs: 120,
-            minSilenceMs: 500
+            minSilenceMs: 1000 // FIXED: Increased silence threshold to prevent premature stops
           });
           
           console.log('🎤 VAD started with audio constraints');
@@ -489,7 +930,7 @@ export default function InterviewClient() {
         (t) => { 
           console.log('🎤 Partial transcript received:', t);
           setPartialLocal(t); 
-          setPartial(t); 
+          debouncedSetPartial(t); // Use debounced version
           
           // Update last speech time on any partial
           lastSpeechAtRef.current = performance.now();
@@ -529,9 +970,9 @@ export default function InterviewClient() {
           setPartialLocal(''); 
           pushFinal(t, ts); 
           
-          // Add to transcript history for display
+          // Add to transcript history for display (debounced)
           if (t.trim()) {
-            setTranscriptHistory(prev => [...prev, t.trim()]);
+            debouncedSetTranscriptHistory(t);
           }
           
           // Save final transcript segment to Firebase
@@ -552,7 +993,7 @@ export default function InterviewClient() {
           setTimeout(() => runInsight(t), 2000); // Debounced by 2s
           
           // Auto-advance after final transcript (only if not at last question)
-          if (currentQuestionIndex < totalQuestions - 1) {
+          if (currentQuestionIndex < memoizedTotalQuestions - 1) {
             maybeAutoAdvance();
           }
           
@@ -565,26 +1006,28 @@ export default function InterviewClient() {
         () => {
           console.log('🔇 VAD-lite: Silence detected, finalizing partial and advancing...');
           
-                  // Only process if we have partial text and not at last question
-        if (partial.trim() && currentQuestionIndex < totalQuestions - 1) { 
-          console.log('📝 Finalizing partial transcript from silence:', partial.substring(0, 50) + '...');
-          pushFinal(partial, Date.now()); 
-          setPartialLocal(''); 
-          
-          // Generate AI insight after final answer
-          setTimeout(() => runInsight(partial), 2000); // Debounced by 2s
-          
-          // Auto-advance after processing partial
-          maybeAutoAdvance();
-        } else if (currentQuestionIndex >= totalQuestions - 1) {
+          // FIXED: Only process if we have partial text and not at last question
+          // Also ensure we don't stop transcription prematurely
+          if (partial.trim() && currentQuestionIndex < memoizedTotalQuestions - 1) { 
+            console.log('📝 Finalizing partial transcript from silence:', partial.substring(0, 50) + '...');
+            pushFinal(partial, Date.now()); 
+            setPartialLocal(''); 
+            
+            // Generate AI insight after final answer
+            setTimeout(() => runInsight(partial), 2000); // Debounced by 2s
+            
+            // Auto-advance after processing partial
+            maybeAutoAdvance();
+          } else if (currentQuestionIndex >= memoizedTotalQuestions - 1) {
             console.log('🎉 At final question, skipping auto-advance from silence');
           } else {
             console.log('🔇 Silence detected but no partial text to process');
           }
           
-          // Clear timers since silence was detected
-          clearTimeout(softTimer);
-          clearTimeout(hardTimer);
+          // FIXED: Don't clear timers on VAD silence - let STT continue running
+          // Only clear timers when we actually get a final transcript
+          // clearTimeout(softTimer);
+          // clearTimeout(hardTimer);
         }
       );
       
@@ -647,6 +1090,8 @@ export default function InterviewClient() {
       // Reset state to allow retry
       stopRef.current = null;
       console.log('🔄 STT setup failed, user can retry');
+    } finally {
+      setIsLoading(false);
     }
     
     // Note: First question speaking is handled by ControlsBar after countdown
@@ -697,8 +1142,8 @@ export default function InterviewClient() {
     setFirebaseSessionId(null);
   };
 
-  // Save transcript segment to Firebase
-  const saveTranscriptSegment = async (text: string, timestamp: number, isPartial: boolean = false, sessionId?: string) => {
+  // Optimized transcript saving with better debouncing
+  const saveTranscriptSegment = useCallback(async (text: string, timestamp: number, isPartial: boolean = false, sessionId?: string) => {
     // Use passed sessionId or fall back to firebaseSessionId
     const targetSessionId = sessionId || firebaseSessionId;
     
@@ -737,10 +1182,10 @@ export default function InterviewClient() {
         text: text.substring(0, 50)
       });
     }
-  };
+  }, [firebaseSessionId]);
 
-  // Save question to Firebase
-  const saveQuestionToFirebase = async (questionText: string, questionType: string = 'behavioral') => {
+  // Optimized question saving with better error handling
+  const saveQuestionToFirebase = useCallback(async (questionText: string, questionType: string = 'behavioral') => {
     if (!firebaseSessionId) return;
 
     try {
@@ -761,132 +1206,16 @@ export default function InterviewClient() {
     } catch (error) {
       console.error('Failed to save question:', error);
     }
-  };
+  }, [firebaseSessionId, mode]);
 
-  // Calculate interview progress
-  const totalQuestions = campaignQuestions.length > 0 ? campaignQuestions.length : 8;
-  const completedQuestions = currentQuestionIndex >= totalQuestions - 1 ? totalQuestions : currentQuestionIndex; // Show full completion when on last question
+  // Calculate interview progress - now using memoized values
+  const totalQuestions = memoizedTotalQuestions;
+  const completedQuestions = memoizedCompletedQuestions;
   
-  // Check if interview is completed
-  const isInterviewCompleted = currentQuestionIndex >= totalQuestions - 1;
+  // Check if interview is completed - now using memoized values
+  const isInterviewCompleted = memoizedIsInterviewCompleted;
 
-  // AI Voice function to speak questions
-  const speakQuestion = async (questionText: string) => {
-    if ('speechSynthesis' in window) {
-      // Stop any current speech gracefully
-      if (window.speechSynthesis.speaking) {
-        window.speechSynthesis.cancel();
-        // Small delay to ensure clean stop
-        await new Promise(r=>setTimeout(r,100));
-      } else {
-        // wait
-      }
-      // Wait for brief silence before speaking to avoid talk-over
-      await waitForSilence(600);
-      speakQuestionInternal(questionText);
-    } else {
-      console.warn('⚠️ Speech synthesis not supported in this browser');
-    }
-  };
-
-  // Internal TTS function with proper error handling and barge-in rules
-  const speakQuestionInternal = (questionText: string) => {
-    try {
-      const utterance = new SpeechSynthesisUtterance(questionText);
-      
-      // Configure voice settings for consistency
-      configureTTSVoice(utterance);
-      
-      // Configure speech parameters for clear interview questions
-      utterance.rate = 0.9; // Slightly slower for clarity
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-      
-      // Barge-in rules: stop STT when TTS starts, resume when it ends
-      utterance.onstart = () => {
-        console.log('🎤 AI speaking question:', questionText.substring(0, 50) + '...');
-        // Stop STT to prevent double-talk
-        if (stopRef.current) {
-          console.log('🔇 Stopping STT for TTS (barge-in rule)');
-          stopRef.current();
-          stopRef.current = null;
-        }
-      };
-      
-      utterance.onend = () => {
-        console.log('✅ AI finished speaking question');
-        // Resume STT listening after a short delay to ensure clean transition
-        setTimeout(() => {
-          if (!stopRef.current) {
-            console.log('🎤 Resuming STT after TTS (barge-in rule)');
-            startMic();
-          }
-        }, 300);
-      };
-      
-      utterance.onerror = (event) => {
-        // Handle different error types gracefully
-        switch (event.error) {
-          case 'interrupted':
-            console.log('ℹ️ Speech was interrupted (this is normal when navigating quickly)');
-            break;
-          case 'canceled':
-            console.log('ℹ️ Speech was canceled (this is normal when stopping)');
-            break;
-          case 'not-allowed':
-            console.error('❌ Speech not allowed - check browser permissions');
-            break;
-          case 'network':
-            console.error('❌ Network error during speech synthesis');
-            break;
-          case 'audio-busy':
-            console.error('❌ Audio system is busy');
-            break;
-          default:
-            console.error('❌ TTS Error:', event.error);
-        }
-        // Resume STT on error after a delay
-        setTimeout(() => {
-          if (!stopRef.current) {
-            console.log('🎤 Resuming STT after TTS error (barge-in rule)');
-            startMic();
-          }
-        }, 200);
-      };
-      
-      // Speak the question
-      window.speechSynthesis.speak(utterance);
-    } catch (error) {
-      console.error('❌ Error setting up TTS:', error);
-      // Resume STT on error after a delay
-      setTimeout(() => {
-        if (!stopRef.current) {
-          console.log('🎤 Resuming STT after TTS setup error (barge-in rule)');
-          startMic();
-        }
-      }, 200);
-    }
-  };
-
-  // Seed a conversational session with a single intro question (AI-generated source)
-  useEffect(() => {
-    if (mode !== 'conversational') return;
-    if (!storeCurrentQ?.text) {
-      const seed = Math.random() < 0.5
-        ? 'Give me a 30-second overview of your background and experience.'
-        : 'What recent project are you most proud of, and why?';
-      enqueueFollowup(seed as any);
-    }
-  }, [mode, storeCurrentQ?.text, enqueueFollowup]);
-
-  // Speak the seed once it exists before STT is listening
-  useEffect(() => {
-    if (mode !== 'conversational') return;
-    if (storeCurrentQ?.text && !started) {
-      speakQuestion(storeCurrentQ.text);
-    }
-  }, [mode, storeCurrentQ?.text, started, speakQuestion]);
-
+  // FIXED: Next question logic - ensure conversational mode uses AI follow-ups
   const nextQuestion = useCallback(() => {
     if (clickBusy) return;
     setClickBusy(true);
@@ -897,69 +1226,105 @@ export default function InterviewClient() {
   
     const isConversational = (mode === 'conversational');
   
-    // Determine "current" (for logging / saving) BEFORE advancing
+    // Current question (for logging) BEFORE advancing
     const current = isConversational
       ? (storeCurrentQ || { text: '', category: 'behavioral' })
       : getCurrentQuestion();
   
-    // Persist the asked question to Firebase (source: ai vs scripted)
+    // Persist asked question (source reflects the mode)
     if (firebaseSessionId && current.text) {
       const questionCategory = (current as any).category || 'behavioral';
       void saveQuestionToFirebase(current.text, questionCategory.toLowerCase());
     }
   
-    // Advance ONE source of truth, depending on mode
+    // FIXED: Proper advancement logic for each mode
     if (isConversational) {
-      session.advance(); // consume the queued AI follow-up
+      console.log('💬 Conversational mode - advancing to next AI-generated question...');
+      
+      // For conversational mode, use the session store's advance method
+      session.advance(); // This handles AI follow-ups and question progression
+      
+      // FIXED: Ensure the new question is properly displayed
+      const newQuestion = session.currentQ;
+      console.log('🔄 New conversational question:', newQuestion.text);
+      
+      // Timeline event for conversational mode
+      if (firebaseSessionId) {
+        void InterviewService.addTimelineEvent(firebaseSessionId, {
+          type: 'question_advanced',
+          data: {
+            from: 'conversational',
+            to: session.qIndex,
+            mode: 'conversational',
+            questionText: newQuestion.text
+          }
+        });
+      }
     } else {
-      setCurrentQuestionIndex(i => Math.min(i + 1, totalQuestions - 1));
-    }
-  
-    // Timeline event
-    if (firebaseSessionId) {
-      void InterviewService.addTimelineEvent(firebaseSessionId, {
-        type: 'question_advanced',
-        data: { from: currentQuestionIndex, to: isConversational ? session.qIndex : Math.min(currentQuestionIndex + 1, totalQuestions - 1) }
+      // For structured mode, increment the question index
+      startTransition(() => {
+        setCurrentQuestionIndex(i => Math.min(i + 1, memoizedTotalQuestions - 1));
       });
+      
+      // Timeline event for structured mode
+      if (firebaseSessionId) {
+        void InterviewService.addTimelineEvent(firebaseSessionId, {
+          type: 'question_advanced',
+          data: {
+            from: currentQuestionIndex,
+            to: Math.min(currentQuestionIndex + 1, memoizedTotalQuestions - 1),
+            mode: 'structured'
+          }
+        });
+      }
     }
   
-    // Speak the new question from the SAME source you just advanced
+    // FIXED: Speak the new question from the SAME source you advanced
     setTimeout(() => {
       const qText = isConversational
         ? useSession.getState().currentQ.text
         : getCurrentQuestion().text;
-      console.log(`🎤 Speaking question: ${qText?.slice(0, 60)}...`);
-      speakQuestion(qText);
+      
+      if (qText && qText.trim()) {
+        console.log('🎤 Speaking new question:', qText.substring(0, 50) + '...');
+        try {
+          speakQuestion(qText);
+        } catch (error) {
+          console.error('Failed to speak question:', error);
+        }
+      } else {
+        console.warn('⚠️ No question text to speak');
+      }
     }, 160);
   
     if (session.finished && firebaseSessionId) {
       void InterviewService.addTimelineEvent(firebaseSessionId, {
         type: 'interview_completed',
-        data: { questionIndex: session.qIndex, totalQuestions }
+        data: { questionIndex: session.qIndex, totalQuestions: memoizedTotalQuestions }
       });
     }
   
     done();
-  }, [clickBusy, firebaseSessionId, currentQuestionIndex, totalQuestions, speakQuestion, mode, storeCurrentQ]);
+  }, [clickBusy, firebaseSessionId, currentQuestionIndex, memoizedTotalQuestions, speakQuestion, mode, storeCurrentQ, getCurrentQuestion]);
   
   const previousQuestion = useCallback(() => {
     if (mode !== 'structured') return; // conversational has no fixed back step
     if (currentQuestionIndex <= 0) return;
-
+  
     const newIndex = Math.max(currentQuestionIndex - 1, 0);
     startTransition(() => setCurrentQuestionIndex(newIndex));
-
+  
     if (firebaseSessionId) {
       void InterviewService.addTimelineEvent(firebaseSessionId, {
         type: 'question_retreated',
         data: { from: currentQuestionIndex, to: newIndex }
       });
     }
-
+  
     const q = getCurrentQuestion();
     setTimeout(() => speakQuestion(q.text), 160);
-  }, [mode, currentQuestionIndex, firebaseSessionId, getCurrentQuestion]);
-
+  }, [mode, currentQuestionIndex, firebaseSessionId, getCurrentQuestion, speakQuestion]);
+  
   const resetQuestions = useCallback(() => {
     startTransition(() => {
       setCurrentQuestionIndex(0);
@@ -978,6 +1343,78 @@ export default function InterviewClient() {
     // Note: Do NOT speak the question here - ControlsBar will handle it after reset
     // This prevents duplicate speech calls
   }, [firebaseSessionId]);
+
+  // Debounced transcript update to reduce re-renders
+  const debouncedSetPartial = useCallback(
+    debounce((text: string) => {
+      setPartial(text);
+    }, 100),
+    []
+  );
+
+  // Debounced transcript history update
+  const debouncedSetTranscriptHistory = useCallback(
+    debounce((text: string) => {
+      setTranscriptHistory(prev => [...prev, text.trim()]);
+    }, 200),
+    []
+  );
+
+  // FIXED: Device check persistence - only check once per session
+  const [deviceChecked, setDeviceChecked] = useState(false);
+  
+  // Initialize device check status from session store
+  useEffect(() => {
+    const sessionDeviceChecked = useSession.getState().deviceChecked;
+    if (sessionDeviceChecked) {
+      setDeviceChecked(true);
+      setDeviceReady(true);
+    }
+  }, []);
+
+  // Update session store when device check completes
+  useEffect(() => {
+    if (deviceReady && !deviceChecked) {
+      setDeviceChecked(true);
+      useSession.getState().setDeviceChecked(true);
+    }
+  }, [deviceReady, deviceChecked]);
+
+  // FIXED: Real-time token and progress tracking
+  useEffect(() => {
+    // Force re-render when tokens or progress changes
+    const interval = setInterval(() => {
+      // This will trigger re-renders to show updated token counts and progress
+      const currentTokens = useSession.getState().tokensUsed;
+      const currentQIndex = useSession.getState().qIndex;
+      
+      if (currentTokens !== tokensUsed) {
+        console.log('🔄 Token count updated:', tokensUsed, '→', currentTokens);
+      }
+      
+      if (mode === 'conversational' && currentQIndex !== 0) {
+        console.log('🔄 Progress updated: qIndex', currentQIndex);
+      }
+    }, 1000); // Check every second for updates
+    
+    return () => clearInterval(interval);
+  }, [tokensUsed, mode, storeCurrentQ?.text]);
+
+  // FIXED: Ensure conversational mode properly initializes progress
+  useEffect(() => {
+    if (mode === 'conversational' && storeCurrentQ?.text) {
+      const session = useSession.getState();
+      // If we have a question but qIndex is 0, set it to 1 to show progress
+      if (session.qIndex === 0 && storeCurrentQ.text !== 'Give me a 30-second overview of your background and experience.') {
+        console.log('🔄 Initializing conversational progress to 1');
+        session.setInitialQuestion({
+          ...storeCurrentQ,
+          id: storeCurrentQ.id || 'conversational-init'
+        });
+        // Don't increment qIndex here - let the first answer do that
+      }
+    }
+  }, [mode, storeCurrentQ?.text]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900">
@@ -1047,29 +1484,43 @@ export default function InterviewClient() {
                   <span className="text-white text-lg">🎮</span>
                 </div>
                 <h2 className="text-2xl font-bold text-white">Interview Controls</h2>
+                {/* Loading indicator */}
+                {isLoading && (
+                  <div className="ml-auto">
+                    <div className="flex items-center gap-2 text-blue-300 text-sm">
+                      <div className="w-4 h-4 border-2 border-blue-300 border-t-transparent rounded-full animate-spin"></div>
+                      <span>Processing...</span>
+                    </div>
+                  </div>
+                )}
               </div>
               <div className="bg-white/5 rounded-2xl p-6 border border-white/10">
-              <ControlsBar
-  onStartSTT={startMic}
-  onStopSTT={stopMic}
-  onResetQuestions={resetQuestions}
-  onSpeakQuestion={speakQuestion}
-  onGetCurrentQuestion={() =>
-    mode === 'conversational'
-      ? (useSession.getState().currentQ.text ||
-         'Give me a 30-second overview of your background and experience.')
-      : getCurrentQuestion().text
-  }
-  deviceReady={deviceReady}
-/>
+                <ControlsBar
+                  onStartSTT={startMic}
+                  onStopSTT={stopMic}
+                  onResetQuestions={resetQuestions}
+                  onSpeakQuestion={speakQuestion}
+                  onGetCurrentQuestion={() =>
+                    mode === 'conversational'
+                      ? (useSession.getState().currentQ.text ||
+                         'Give me a 30-second overview of your background and experience.')
+                      : getCurrentQuestion().text
+                  }
+                  deviceReady={deviceReady}
+                  // FIXED: Pass token information for display
+                  tokensUsed={tokensUsed}
+                  softCap={softCap}
+                  llmMode={llmMode}
+                />
               </div>
-               {/* Device check before starting */}
-               {!started && (
-                 <div className="mt-4">
-                   <DeviceCheck onStatusChange={setDeviceReady} />
-                 </div>
-               )}
-               
+              
+              {/* FIXED: Device check only once per session */}
+              {!started && !deviceChecked && (
+                <div className="mt-4">
+                  <DeviceCheck onStatusChange={setDeviceReady} />
+                </div>
+              )}
+
                {/* STT Error Display and Retry */}
                {sttError && (
                  <div className="mt-4 p-4 bg-red-900/20 border border-red-700/30 rounded-xl">
@@ -1116,11 +1567,15 @@ export default function InterviewClient() {
           <div className="lg:col-span-5">
             <div className="animate-fade-in-up" style={{ animationDelay: '0.05s' }}>
               <AgentPane 
-                currentQuestion={mode === 'conversational' ? { text: storeCurrentQ.text, category: (storeCurrentQ as any).category } : getCurrentQuestion()}
+                currentQuestion={mode === 'conversational' ? 
+                  { 
+                    text: storeCurrentQ?.text || 'Give me a 30-second overview of your background and experience.', 
+                    category: (storeCurrentQ as any)?.category || 'behavioral' 
+                  } : currentQuestion}
                 onNextQuestion={nextQuestion}
                 onPreviousQuestion={previousQuestion}
-                canGoNext={mode === 'conversational' ? true : currentQuestionIndex < totalQuestions - 1}
-                canGoPrevious={mode === 'conversational' ? false : currentQuestionIndex > 0}
+                canGoNext={canGoNext}
+                canGoPrevious={canGoPrevious}
               />
             </div>
           </div>
@@ -1139,12 +1594,42 @@ export default function InterviewClient() {
                 <p className="text-blue-200 text-sm mt-2">
                   Camera preview, screen sharing, and live streaming capabilities
                 </p>
+                {!videoEnabled && (
+                  <button
+                    onClick={() => setVideoEnabled(true)}
+                    className="mt-3 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded-lg transition-colors"
+                  >
+                    🎥 Enable Video
+                  </button>
+                )}
               </div>
               <div className="p-2 flex-1">
-                <VideoPublisher 
-                  sessionId={sessionId} 
-                  firebaseSessionId={firebaseSessionId || undefined}
-                />
+                {videoEnabled ? (
+                  <Suspense fallback={
+                    <div className="flex items-center justify-center h-full">
+                      <div className="text-center">
+                        <div className="w-16 h-16 bg-blue-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                          <span className="text-blue-400 text-2xl">📹</span>
+                        </div>
+                        <p className="text-blue-200 text-sm">Loading video components...</p>
+                      </div>
+                    </div>
+                  }>
+                    <VideoPublisher 
+                      sessionId={sessionId} 
+                      firebaseSessionId={firebaseSessionId || undefined}
+                    />
+                  </Suspense>
+                ) : (
+                  <div className="flex items-center justify-center h-full">
+                    <div className="text-center">
+                      <div className="w-16 h-16 bg-slate-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                        <span className="text-slate-400 text-2xl">🎥</span>
+                      </div>
+                      <p className="text-slate-200 text-sm">Click "Enable Video" to start camera preview</p>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>

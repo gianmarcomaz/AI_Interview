@@ -33,11 +33,16 @@ function rulesInsight(turnId: string, snippet: string, facts: {id:string;text:st
   ));
   const cites = facts.slice(0,2).map(f => f.id);
   
-  // Enhanced follow-up logic for rules mode
+  // FIXED: Always generate a follow-up question for conversational mode
   const needsDepth = s.length < 60 || /general|generic|unsure/i.test(s);
-  const fu = needsDepth ? "Can you share a concrete example with numbers?" : undefined;
+  const followup = needsDepth 
+    ? "Can you share a concrete example with numbers?" 
+    : "What's another area of your experience you'd like to discuss?";
   
-  return { schema_version: 1, turn_id: turnId, summary: sum.slice(0, 120), tags: tags.slice(0,3), citations: cites, followup: fu };
+  // FIXED: Ensure followup is never empty
+  const safeFollowup = followup.trim() || "Could you give a concrete example with metrics?";
+  
+  return { schema_version: 1, turn_id: turnId, summary: sum.slice(0, 120), tags: tags.slice(0,3), citations: cites, followup: safeFollowup };
 }
 
 export async function generateInsight(input: InsightInput): Promise<{ json: Insight; latency: number; usedTokens: number }> {
@@ -57,8 +62,9 @@ export async function generateInsight(input: InsightInput): Promise<{ json: Insi
   const system = [
     "You are an interview insight engine.",
     "Return STRICT JSON only:",
-    "{ schema_version:1, turn_id:string, summary<=120, tags:string[<=3], citations?:string[<=3], followup?:string<=140 }",
-    "followup: at most ~15 words, only if the candidate's answer needs depth/clarity; otherwise omit.",
+    "{ schema_version:1, turn_id:string, summary<=120, tags:string[<=3], citations?:string[<=3], followup:string<=140 }",
+    "followup: at most ~15 words, ALWAYS provide the next question for the candidate (ask for more detail if the last answer was shallow, or introduce a new topic if it was thorough).",
+    "IMPORTANT: The followup field is REQUIRED and must contain a natural, conversational question.",
   ].join("\n");
 
   const user = [
@@ -73,14 +79,30 @@ export async function generateInsight(input: InsightInput): Promise<{ json: Insi
     const { text, usage } = await callCloudJSON(system, user, 120);
     const parsed = InsightSchema.safeParse(JSON.parse(text));
     if (!parsed.success) throw new Error("schema_fail");
-    return { json: parsed.data, latency: performance.now() - t0, usedTokens: usage?.total_tokens ?? 0 };
+    
+    // FIXED: Ensure followup is always present
+    const json = parsed.data;
+    if (!json.followup || !json.followup.trim()) {
+      json.followup = "Could you give a concrete example with metrics?";
+      console.log('⚠️ LLM returned empty followup, using fallback');
+    }
+    
+    return { json, latency: performance.now() - t0, usedTokens: usage?.total_tokens ?? 0 };
   } catch {
     // one retry with tighter instruction
     try {
       const { text, usage } = await callCloudJSON(system + "\nSTRICT: Do not include any text outside JSON.", user, 120);
       const parsed = InsightSchema.safeParse(JSON.parse(text));
       if (!parsed.success) throw new Error("schema_fail_2");
-      return { json: parsed.data, latency: performance.now() - t0, usedTokens: usage?.total_tokens ?? 0 };
+      
+      // FIXED: Ensure followup is always present on retry too
+      const json = parsed.data;
+      if (!json.followup || !json.followup.trim()) {
+        json.followup = "Could you give a concrete example with metrics?";
+        console.log('⚠️ LLM retry returned empty followup, using fallback');
+      }
+      
+      return { json, latency: performance.now() - t0, usedTokens: usage?.total_tokens ?? 0 };
     } catch {
       const json = rulesInsight(turnId, snippet, facts);
       return { json, latency: performance.now() - t0, usedTokens: 0 };

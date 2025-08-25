@@ -81,7 +81,7 @@ type State = {
   // Day 2 additions (LLM insights)
   llmMode: 'cloud'|'rules';
   rollingSummary: string;
-  lastInsight?: { schema_version: 1; turn_id: string; summary: string; tags: string[]; citations?: string[]; flags?: string[] };
+  lastInsight?: { schema_version: 1; turn_id: string; summary: string; tags: string[]; citations?: string[]; flags?: string[]; followup?: string };
   lastLatencyMs?: number;
   tagTally: Record<string, number>;
   // AI interview system additions
@@ -95,12 +95,15 @@ type State = {
   ttsVoice?: string;
   // Consent gate
   consentAccepted: boolean;
+  // Device check persistence
+  deviceChecked: boolean;
   setCampaign(id?: string): void;
   setMode(m: 'structured'|'conversational'): void;
   setLLMMode(m: 'cloud'|'rules'): void;
   setLang(lang: string): void;
   setTtsVoice(v?: string): void;
   setConsent(v: boolean): void;
+  setDeviceChecked(v: boolean): void;
   start(): void; 
   stop(): void;
   setPartial(t: string): void;
@@ -116,6 +119,7 @@ type State = {
   clearFollowups: () => void;
   appendTranscript: (e: ReportTranscript) => void;
   setTranscript: (tx: ReportTranscript[]) => void;
+  setInitialQuestion(q: Question): void;
   advance: () => void;
 };
 
@@ -150,6 +154,7 @@ export const useSession = create<State>((set, get) => ({
   followupQueue: [],
   ttsVoice: undefined,
   consentAccepted: false,
+  deviceChecked: false,
 
   setCampaign(id) { set({ campaignId: id }); },
   setMode(m) { set({ mode: m }); },
@@ -157,6 +162,7 @@ export const useSession = create<State>((set, get) => ({
   setLang(lang) { set({ lang }); },
   setTtsVoice(v) { set({ ttsVoice: v }); },
   setConsent(v) { set({ consentAccepted: v }); },
+  setDeviceChecked(v) { set({ deviceChecked: v }); },
   start() { set({ started: true, finished: false, qIndex: 0, askedIds: [], currentQ: pickInitial(), transcript: [], partial: '', lastAnswer: undefined }); },
   stop() { set({ started: false, partial: '' }); },
   setPartial(t) { set({ partial: t }); },
@@ -200,6 +206,9 @@ export const useSession = create<State>((set, get) => ({
   setTranscript: (tx: ReportTranscript[]) => set({ 
     transcript: tx.map(e => ({ text: e.text, final: e.role === "user", ts: Date.now() })) 
   }),
+  setInitialQuestion(q) {
+    set({ currentQ: q });
+  },
   advance: () => {
     if (__advancing) return;
     __advancing = true;
@@ -208,9 +217,13 @@ export const useSession = create<State>((set, get) => ({
     set((s) => {
       if (s.finished) return s;
 
-      const { mode, lastAnswer, currentQ, qIndex, askedIds, followupQueue } = s;
+      const { mode, lastAnswer, currentQ, qIndex, askedIds, followupQueue, lastInsight } = s;
 
       if (mode === 'conversational') {
+        console.log('💬 Conversational mode - advancing...');
+        console.log('📋 Follow-up queue length:', followupQueue.length);
+        console.log('🔍 Last insight follow-up:', lastInsight?.followup);
+        
         // Prioritize AI-generated follow-ups from the queue
         if (followupQueue.length > 0) {
           const nextFollowup = s.dequeueFollowup();
@@ -218,31 +231,40 @@ export const useSession = create<State>((set, get) => ({
             const nextQ: Question = { 
               ...currentQ, 
               id: currentQ.id + '-ai-followup', 
-              text: nextFollowup 
+              text: nextFollowup,
+              topic: 'behavioral',
+              difficulty: 2
             };
-            return { currentQ: nextQ, lastAnswer: undefined };
+            console.log('🔄 Using queued AI follow-up:', nextFollowup.substring(0, 50) + '...');
+            // FIXED: Increment qIndex for AI follow-ups to track progress
+            const newQIndex = qIndex + 1;
+            console.log('📊 Progress updated: qIndex', qIndex, '→', newQIndex);
+            return { currentQ: nextQ, lastAnswer: undefined, qIndex: newQIndex };
           }
         }
 
-        // Fallback to existing conversational logic if no AI follow-ups
-        const isFollowup = /-f$/.test(currentQ.id);
-        const baseId = currentQ.id.replace(/(?:-f)+$/, '');
-        const hasAnswer = !!(lastAnswer && lastAnswer.trim().length > 0);
-        const short = !hasAnswer || (lastAnswer!.trim().length < 60 || lastAnswer!.split(/\s+/).length < 10);
-
-        // If short and not already a follow-up, ask one follow-up, then stop
-        if (short && !isFollowup) {
-          const updatedAsked = Array.from(new Set([ ...askedIds, baseId ]));
-          const nextQ: Question = { ...currentQ, id: baseId+'-f', text: 'Could you add concrete metrics or a specific example?' };
-          return { currentQ: nextQ, lastAnswer: undefined, askedIds: updatedAsked };
+        // If no queued follow-ups, check if we have a recent insight with a follow-up
+        if (lastInsight?.followup && lastInsight.followup.trim().length > 0) {
+          const nextQ: Question = { 
+            ...currentQ, 
+            id: currentQ.id + '-ai-insight-followup', 
+            text: lastInsight.followup,
+            topic: 'behavioral',
+            difficulty: 2
+          };
+          console.log('🔄 Using insight follow-up:', lastInsight.followup.substring(0, 50) + '...');
+          // FIXED: Increment qIndex for AI insight follow-ups to track progress
+          const newQIndex = qIndex + 1;
+          console.log('📊 Progress updated: qIndex', qIndex, '→', newQIndex);
+          return { currentQ: nextQ, lastAnswer: undefined, qIndex: newQIndex };
         }
 
-        // Otherwise advance to the next unasked base question
-        const updatedAsked = Array.from(new Set([ ...askedIds, baseId ]));
-        const allAsked = updatedAsked.length >= QUESTION_BANK.length;
-        if (allAsked) { return { finished: true, lastAnswer: undefined, askedIds: updatedAsked }; }
-        const nextBase = pickNextDynamic(hasAnswer ? lastAnswer : baseId, updatedAsked);
-        return { currentQ: nextBase, lastAnswer: undefined, askedIds: updatedAsked };
+        // FIXED: For conversational mode, if no AI follow-ups are available, 
+        // we should wait for the next insight rather than falling back to structured questions
+        console.log('⏳ No AI follow-ups available, waiting for next insight...');
+        
+        // Don't advance - stay on current question until AI generates a follow-up
+        return s;
       }
       
       // structured: centralized advance with no double-increment on followups

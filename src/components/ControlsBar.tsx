@@ -10,7 +10,10 @@ export default function ControlsBar({
   onResetQuestions,
   onSpeakQuestion,
   onGetCurrentQuestion,
-  deviceReady = true
+  deviceReady = true,
+  tokensUsed = 0,
+  softCap = 0,
+  llmMode = 'rules'
 }: { 
   onStartSTT: () => void; 
   onStopSTT: () => void;
@@ -18,6 +21,9 @@ export default function ControlsBar({
   onSpeakQuestion?: (text: string) => void;
   onGetCurrentQuestion?: () => string;
   deviceReady?: boolean;
+  tokensUsed?: number;
+  softCap?: number;
+  llmMode?: 'cloud' | 'rules';
 }) {
   // Narrow selector to avoid unnecessary re-renders
   const started = useSession(s => s.started);
@@ -26,6 +32,17 @@ export default function ControlsBar({
   const ttsVoice = useSession(s => s.ttsVoice);
   const consentAccepted = useSession(s => s.consentAccepted);
   const setConsent = useSession(s => s.setConsent);
+  
+  // FIXED: Get real-time token updates from session store
+  const sessionTokensUsed = useSession(s => s.tokensUsed);
+  const sessionSoftCap = useSession(s => s.softCap);
+  const sessionLLMMode = useSession(s => s.llmMode);
+  
+  // Use session store values if available, fall back to props
+  const currentTokensUsed = sessionTokensUsed || tokensUsed;
+  const currentSoftCap = sessionSoftCap || softCap;
+  const currentLLMMode = sessionLLMMode || llmMode;
+  
   const [showCountdown, setShowCountdown] = useState(false);
   const [countdown, setCountdown] = useState(3);
   const [mounted, setMounted] = useState(false);
@@ -191,7 +208,7 @@ export default function ControlsBar({
             <div className="text-[11px] text-blue-200/70 mt-1">
               Voice: {ttsVoice ? 'Custom' : 'Default'}
             </div>
-            {/* Tiny analytics footer */}
+            {/* FIXED: Token count display */}
             {started && (
               <div className="mt-2 pt-2 border-t border-white/10">
                 <div className="text-[10px] text-blue-200/60 space-x-2">
@@ -199,9 +216,9 @@ export default function ControlsBar({
                   <span>•</span>
                   <span>Turns: 12</span>
                   <span>•</span>
-                  <span>Mode: {useSession.getState().llmMode}</span>
+                  <span>Mode: {currentLLMMode}</span>
                   <span>•</span>
-                  <span>Tokens: {useSession.getState().tokensUsed}/{useSession.getState().softCap}</span>
+                  <span>Tokens: {currentTokensUsed}/{currentSoftCap}</span>
                 </div>
               </div>
             )}

@@ -12,7 +12,8 @@ export const InsightSchema = z.object({
   summary: z.string().max(120),
   tags: z.array(z.enum(ALLOWED_TAGS)).min(1).max(4),
   citations: z.array(z.string()).max(3).optional(),
-  flags: z.array(z.enum(["risky_topic","pii","format_fix"])).optional()
+  flags: z.array(z.enum(["risky_topic","pii","format_fix"])).optional(),
+  followup: z.string().max(140).optional() // AI-generated follow-up question
 });
 
 export type Insight = z.infer<typeof InsightSchema>;

@@ -15,6 +15,7 @@ TASK:
 - Choose 1–3 tags from ALLOWED_TAGS (provided in schema).
 - If facts are provided and used, include their IDs as "citations".
 - Be neutral and factual.
+- ALWAYS provide a follow-up question (either for clarification if answer was shallow, or to introduce a new topic if answer was thorough).
 
 CONTEXT:
 - Rolling summary: "${rollingSummary}"
@@ -34,6 +35,7 @@ export function retryPrompt(original: string, snippet: string) {
 IMPORTANT:
 - Return VALID JSON only (no prose)
 - Ensure the "summary" reflects this snippet: "${snippet}"
+- ALWAYS include a follow-up question in the response
 `;
 }
 
