@@ -1,5 +1,6 @@
 'use client';
 import { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useSession } from '@/lib/store/session';
 import { Button } from '@/components/ui/button';
 
@@ -19,6 +20,7 @@ export default function ControlsBar({
   const { started, start, stop, lang, ttsVoice } = useSession();
   const [showCountdown, setShowCountdown] = useState(false);
   const [countdown, setCountdown] = useState(3);
+  const [mounted, setMounted] = useState(false);
   
   useEffect(() => {
     if (showCountdown && countdown > 0) {
@@ -29,20 +31,29 @@ export default function ControlsBar({
     } else if (showCountdown && countdown === 0) {
       // Countdown finished, start interview and speak first question
       setShowCountdown(false);
+      // Preload voices to avoid default-voice fallback on first utterance
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.getVoices();
+      }
       start();
-      onStartSTT();
+      // Start STT after a short delay to avoid competing with first TTS
+      setTimeout(() => onStartSTT(), 150);
 
       // Small delay to ensure everything is ready, then speak the first question
       setTimeout(() => {
         if (onSpeakQuestion && onGetCurrentQuestion) {
-          // Get the first question dynamically to ensure it matches the campaign questions
           const firstQuestion = onGetCurrentQuestion();
           console.log('🎤 ControlsBar speaking first question after countdown:', firstQuestion.substring(0, 50) + '...');
-          onSpeakQuestion(firstQuestion);
+          // Give voices a brief moment to load before first speak
+          setTimeout(() => onSpeakQuestion(firstQuestion), 250);
         }
-      }, 500); // Increased delay to ensure question index is properly set
+      }, 400);
     }
   }, [showCountdown, countdown, start, onStartSTT]);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
   
   const handleStartInterview = () => {
     setShowCountdown(true);
@@ -60,12 +71,12 @@ export default function ControlsBar({
   return (
     <>
       {/* Countdown Overlay */}
-      {showCountdown && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center">
-          <div className="text-center space-y-8">
+      {showCountdown && mounted && createPortal(
+        <div className="fixed inset-0 w-screen h-screen bg-black/90 z-[2147483647] flex items-center justify-center select-none">
+          <div className="text-center space-y-6">
             {/* Countdown Number */}
             <div className="relative">
-              <div className="text-9xl font-bold text-white animate-pulse">
+              <div className="text-7xl font-bold text-white animate-pulse">
                 {countdown}
               </div>
               {/* Glowing Ring Effect */}
@@ -74,9 +85,9 @@ export default function ControlsBar({
             </div>
             
             {/* Countdown Text */}
-            <div className="space-y-4">
-              <h2 className="text-4xl font-bold text-white">Get Ready!</h2>
-              <p className="text-xl text-blue-200">Interview starting in...</p>
+            <div className="space-y-2">
+              <h2 className="text-3xl font-bold text-white">Get Ready!</h2>
+              <p className="text-lg text-blue-200">Interview starting in...</p>
             </div>
             
             {/* Progress Ring */}
@@ -110,14 +121,15 @@ export default function ControlsBar({
               </svg>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
       
-      <div className="flex gap-4 items-center flex-wrap">
+      <div className="flex gap-3 items-center flex-wrap">
         {!started ? (
           <Button 
             onClick={handleStartInterview}
-            size="xl"
+            size="lg"
             cta="success"
             shadow
             disabled={showCountdown}
@@ -131,7 +143,7 @@ export default function ControlsBar({
               stop(); 
               onStopSTT(); 
             }}
-            size="xl"
+            size="lg"
             cta="danger"
             shadow
           >
@@ -142,7 +154,7 @@ export default function ControlsBar({
         <Button 
           onClick={handleRepeatQuestion}
           variant="secondary"
-          size="xl"
+          size="lg"
           cta="primary"
           shadow
         >
@@ -151,7 +163,7 @@ export default function ControlsBar({
         
         <div className="ml-auto">
           <div className="text-center">
-            <div className="text-sm text-blue-200 mb-1">Session Status</div>
+            <div className="text-xs text-blue-200 mb-1">Session Status</div>
             <div className={`px-3 py-1 rounded-full text-sm font-semibold ${
               started 
                 ? 'bg-green-600/20 border border-green-500/30 text-green-300' 
@@ -159,7 +171,7 @@ export default function ControlsBar({
             }`}>
               {started ? '🟢 Active' : '🔴 Inactive'}
             </div>
-            <div className="text-xs text-blue-200/70 mt-1">
+            <div className="text-[11px] text-blue-200/70 mt-1">
               Voice: {ttsVoice ? 'Custom' : 'Default'}
             </div>
           </div>

@@ -95,9 +95,13 @@ export default function InterviewSettings() {
     }
   }, [id]);
 
+  const [justSaved, setJustSaved] = useState(false);
+
   const saveSettings = () => {
     const settingsWithQuestions = { ...settings, questions };
     localStorage.setItem(`campaign-settings-${id}`, JSON.stringify(settingsWithQuestions));
+    setJustSaved(true);
+    setTimeout(() => setJustSaved(false), 2000);
   };
 
   const updateSetting = (key: string, value: any) => {
@@ -515,6 +519,11 @@ export default function InterviewSettings() {
           >
             💾 Save Campaign Settings
           </Button>
+          {justSaved && (
+            <div className="mt-3 inline-flex items-center gap-2 px-3 py-1 rounded-lg bg-green-600/20 border border-green-500/30 text-green-200 text-sm">
+              ✅ Changes saved
+            </div>
+          )}
           <p className="text-blue-200 text-sm mt-3">
             Settings will be applied to all future interviews in this campaign
           </p>

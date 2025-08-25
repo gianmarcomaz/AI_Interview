@@ -26,7 +26,8 @@ export default function InterviewClient() {
   const {
     setCampaign,
     lang,         // STT language
-    // ttsVoice,     // TTS voice (used by ControlsBar directly)
+    setLang,
+    setTtsVoice,
     setPartial,
     pushFinal,
     transcript,   // needed for TranscriptPane
@@ -44,7 +45,7 @@ export default function InterviewClient() {
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [firebaseSessionId, setFirebaseSessionId] = useState<string | null>(null);
 
-  // Initialize campaign + (optional) interview mode (separate from LLM mode)
+  // Initialize campaign + load saved campaign settings (lang, ttsVoice, questions)
   useEffect(() => {
     setCampaign(campaignParam || undefined);
     
@@ -53,8 +54,20 @@ export default function InterviewClient() {
       const questions = loadCampaignQuestions(campaignParam);
       console.log('📚 Loaded campaign questions:', questions);
       setCampaignQuestions(questions);
+
+      // Load saved voice/language from campaign settings
+      try {
+        const raw = localStorage.getItem(`campaign-settings-${campaignParam}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed.sttLanguage) setLang(parsed.sttLanguage);
+          if (parsed.ttsVoice) setTtsVoice(parsed.ttsVoice);
+        }
+      } catch (e) {
+        console.warn('Failed to load campaign settings for session:', e);
+      }
     }
-  }, [campaignParam, setCampaign]);
+  }, [campaignParam, setCampaign, setLang, setTtsVoice]);
 
   // Create Firebase session when component mounts (only once)
   useEffect(() => {
@@ -740,46 +753,45 @@ export default function InterviewClient() {
           </div>
         </div>
 
-        {/* Enhanced Controls Bar */}
-        <div className="bg-gradient-to-r from-white/10 via-white/5 to-white/10 backdrop-blur-lg rounded-3xl border border-white/20 p-8 shadow-glow">
-          <div className="flex items-center gap-4 mb-8">
-            <div className="w-10 h-10 bg-gradient-to-br from-green-500 to-blue-600 rounded-xl flex items-center justify-center animate-glow">
-              <span className="text-white text-lg">🎮</span>
-            </div>
-            <h2 className="text-3xl font-bold text-white">Interview Controls</h2>
-          </div>
-          
-          <div className="bg-white/5 rounded-2xl p-8 border border-white/10">
-            <ControlsBar 
-              onStartSTT={startMic} 
-              onStopSTT={stopMic} 
-              onResetQuestions={resetQuestions}
-              onSpeakQuestion={speakQuestion}
-              onGetCurrentQuestion={() => getCurrentQuestion().text}
-            />
-          </div>
-          
-          <div className="mt-8 p-6 bg-gradient-to-r from-blue-900/20 to-purple-900/20 rounded-2xl border border-blue-700/30">
-            <div className="flex items-start gap-4">
-              <div className="w-8 h-8 bg-yellow-500/20 rounded-full flex items-center justify-center flex-shrink-0 mt-1">
-                <span className="text-yellow-400 text-lg">💡</span>
+        {/* Top Row: Controls + Current Question */}
+        <div className="grid lg:grid-cols-12 gap-6 items-stretch">
+          <div className="lg:col-span-7">
+            <div className="bg-gradient-to-r from-white/10 via-white/5 to-white/10 backdrop-blur-lg rounded-3xl border border-white/20 p-6 shadow-glow">
+              <div className="flex items-center gap-4 mb-6">
+                <div className="w-10 h-10 bg-gradient-to-br from-green-500 to-blue-600 rounded-xl flex items-center justify-center animate-glow">
+                  <span className="text-white text-lg">🎮</span>
+                </div>
+                <h2 className="text-2xl font-bold text-white">Interview Controls</h2>
               </div>
-              <div>
-                <p className="text-blue-100 text-base font-semibold mb-3">Pro Tips for Best Results</p>
-                <p className="text-blue-200 text-sm leading-relaxed">
-                  Use Chrome browser for optimal speech recognition. Click "Start" to begin, "Repeat" to re-ask questions, 
-                  and "Next" to advance through the interview flow. Speak clearly and take your time with responses.
-                </p>
+              <div className="bg-white/5 rounded-2xl p-6 border border-white/10">
+                <ControlsBar 
+                  onStartSTT={startMic} 
+                  onStopSTT={stopMic} 
+                  onResetQuestions={resetQuestions}
+                  onSpeakQuestion={speakQuestion}
+                  onGetCurrentQuestion={() => getCurrentQuestion().text}
+                />
               </div>
             </div>
-          </div>
-        </div>
 
-        {/* Main Interview Interface - Simplified Layout */}
-        <div className="grid lg:grid-cols-12 gap-8 items-start">
-          {/* Left Column - Interview Core */}
-          <div className="lg:col-span-4 space-y-8">
-            <div className="animate-fade-in-up" style={{ animationDelay: '0.1s' }}>
+            {/* Pro Tips compact card under controls */}
+            <div className="mt-6 p-5 bg-gradient-to-r from-blue-900/20 to-purple-900/20 rounded-2xl border border-blue-700/30">
+              <div className="flex items-start gap-3">
+                <div className="w-7 h-7 bg-yellow-500/20 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
+                  <span className="text-yellow-400 text-base">💡</span>
+                </div>
+                <div>
+                  <p className="text-blue-100 text-base font-semibold mb-2">Pro Tips for Best Results</p>
+                  <p className="text-blue-200 text-sm leading-relaxed">
+                    Use Chrome browser for optimal speech recognition. Click "Start" to begin, "Repeat" to re-ask questions,
+                    and "Next" to advance through the interview flow. Speak clearly and take your time with responses.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="lg:col-span-5">
+            <div className="animate-fade-in-up" style={{ animationDelay: '0.05s' }}>
               <AgentPane 
                 currentQuestion={getCurrentQuestion()}
                 onNextQuestion={nextQuestion}
@@ -789,52 +801,55 @@ export default function InterviewClient() {
               />
             </div>
           </div>
-          
-          {/* Right Column - Video & Transcript side by side */}
-          <div className="lg:col-span-8">
-            <div className="grid md:grid-cols-2 gap-8">
-              {/* Video Publisher - Enhanced Display */}
-              <div className="bg-white/5 backdrop-blur-lg rounded-3xl border border-white/20 overflow-hidden shadow-glow animate-fade-in-up" style={{ animationDelay: '0.3s' }}>
-                <div className="p-6 border-b border-white/10 bg-gradient-to-r from-white/5 to-white/10">
-                  <h3 className="text-xl font-semibold text-white flex items-center gap-3">
-                    <span className="w-3 h-3 bg-green-400 rounded-full animate-pulse"></span>
-                    Live Video Stream
-                  </h3>
-                  <p className="text-blue-200 text-sm mt-2">
-                    Camera preview, screen sharing, and live streaming capabilities
-                  </p>
-                </div>
-                <div className="p-2">
-                  <VideoPublisher 
-                    sessionId={sessionId} 
-                    firebaseSessionId={firebaseSessionId || undefined}
-                  />
-                </div>
-              </div>
+        </div>
 
-              {/* Transcript Pane - Enhanced */}
-              <div className="animate-fade-in-up" style={{ animationDelay: '0.4s' }}>
-                <div className="bg-white/5 backdrop-blur-lg rounded-3xl border border-white/20 overflow-hidden shadow-glow h-full">
-                  <div className="p-6 border-b border-white/10 bg-gradient-to-r from-white/5 to-white/10">
-                    <h3 className="text-xl font-semibold text-white flex items-center gap-3">
-                      <span className="w-3 h-3 bg-blue-400 rounded-full animate-pulse"></span>
-                      Live Transcript
-                    </h3>
-                    <p className="text-blue-200 text-sm mt-2">
-                      Real-time speech-to-text with AI-powered insights
-                    </p>
-                  </div>
-                  <div className="p-2">
-                    <TranscriptPane 
-                      partial={partial} 
-                      listening={Boolean(stopRef.current)}
-                    />
-                  </div>
-                </div>
+        {/* Main Interview Interface */}
+        <div className="grid lg:grid-cols-12 gap-6 items-start">
+          {/* Left: Video */}
+          <div className="lg:col-span-7 space-y-6">
+            <div className="bg-white/5 backdrop-blur-lg rounded-3xl border border-white/20 overflow-hidden shadow-glow animate-fade-in-up h-full min-h-[720px] flex flex-col" style={{ animationDelay: '0.1s' }}>
+              <div className="p-6 border-b border-white/10 bg-gradient-to-r from-white/5 to-white/10">
+                <h3 className="text-xl font-semibold text-white flex items-center gap-3">
+                  <span className="w-3 h-3 bg-green-400 rounded-full animate-pulse"></span>
+                  Live Video Stream
+                </h3>
+                <p className="text-blue-200 text-sm mt-2">
+                  Camera preview, screen sharing, and live streaming capabilities
+                </p>
+              </div>
+              <div className="p-2 flex-1">
+                <VideoPublisher 
+                  sessionId={sessionId} 
+                  firebaseSessionId={firebaseSessionId || undefined}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Right: Live Transcript */}
+          <div className="lg:col-span-5">
+            <div className="bg-white/5 backdrop-blur-lg rounded-3xl border border-white/20 overflow-hidden shadow-glow animate-fade-in-up h-full min-h-[720px] flex flex-col" style={{ animationDelay: '0.15s' }}>
+              <div className="p-6 border-b border-white/10 bg-gradient-to-r from-white/5 to-white/10">
+                <h3 className="text-xl font-semibold text-white flex items-center gap-3">
+                  <span className="w-3 h-3 bg-blue-400 rounded-full animate-pulse"></span>
+                  Live Transcript
+                </h3>
+                <p className="text-blue-200 text-sm mt-2">
+                  Real-time speech-to-text with AI-powered insights
+                </p>
+              </div>
+              <div className="p-2 flex-1">
+                <TranscriptPane 
+                  partial={partial} 
+                  listening={Boolean(stopRef.current)}
+                />
               </div>
             </div>
           </div>
         </div>
+
+
+        
 
         {/* Interview Completion Screen */}
         {isInterviewCompleted && (
