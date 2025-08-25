@@ -89,7 +89,12 @@ export default function CampaignDashboard() {
               </p>
             </div>
             <button 
-              onClick={() => sampleSession && navigator.clipboard.writeText(sampleSession)}
+              onClick={async () => {
+                if (!sampleSession) return;
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                  try { await navigator.clipboard.writeText(sampleSession); } catch {}
+                }
+              }}
               disabled={!sampleSession}
               className="mt-3 h-10 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-purple-600 text-white font-medium hover:from-blue-700 hover:to-purple-700 shadow-glow text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -111,7 +116,12 @@ export default function CampaignDashboard() {
               </pre>
             </div>
             <button 
-              onClick={() => embedSnippet && navigator.clipboard.writeText(embedSnippet)}
+              onClick={async () => {
+                if (!embedSnippet) return;
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                  try { await navigator.clipboard.writeText(embedSnippet); } catch {}
+                }
+              }}
               disabled={!embedSnippet}
               className="mt-3 h-10 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 text-white font-medium hover:from-purple-700 hover:to-pink-700 shadow-glow text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >

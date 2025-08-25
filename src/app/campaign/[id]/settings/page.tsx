@@ -18,7 +18,8 @@ export default function InterviewSettings() {
     jobDescription: '',
     resumeRequirements: '',
     interviewDuration: 30,
-    questionCount: 8
+    questionCount: 8,
+    studyTemplate: 'custom'
   });
 
   const [testMessage] = useState("Hello! This is a test of the selected voice. How does it sound to you?");
@@ -78,6 +79,46 @@ export default function InterviewSettings() {
   const [editingQuestion, setEditingQuestion] = useState<number | null>(null);
   const [editingText, setEditingText] = useState('');
 
+  // Study templates with pre-built questions and follow-up rules
+  const studyTemplates = {
+    'product-usability': {
+      name: 'Product Usability',
+      description: 'Research user experience and interface effectiveness',
+      questions: [
+        { id: 1, category: 'INTRO', text: 'Hi, I\'m your interviewer. Ready to begin?', order: 1 },
+        { id: 2, category: 'USABILITY', text: 'Walk me through the last time you used our product. What was your goal?', order: 2 },
+        { id: 3, category: 'PAIN_POINTS', text: 'What was the most frustrating part of that experience?', order: 3 },
+        { id: 4, category: 'FEEDBACK', text: 'If you could change one thing about the interface, what would it be?', order: 4 },
+        { id: 5, category: 'COMPARISON', text: 'How does this compare to similar tools you\'ve used?', order: 5 },
+        { id: 6, category: 'IMPROVEMENT', text: 'What would make you recommend this product to a colleague?', order: 6 }
+      ]
+    },
+    'pricing-research': {
+      name: 'Pricing Research',
+      description: 'Understand willingness to pay and pricing sensitivity',
+      questions: [
+        { id: 1, category: 'INTRO', text: 'Hi, I\'m your interviewer. Ready to begin?', order: 1 },
+        { id: 2, category: 'CURRENT_TOOLS', text: 'What tools do you currently use for this type of work?', order: 2 },
+        { id: 3, category: 'BUDGET', text: 'What\'s your typical budget for professional tools?', order: 3 },
+        { id: 4, category: 'VALUE', text: 'How much would you be willing to pay for a solution that saves you 2 hours per week?', order: 4 },
+        { id: 5, category: 'FEATURES', text: 'Which features would justify a higher price point?', order: 5 },
+        { id: 6, category: 'COMPETITION', text: 'How do you evaluate pricing when comparing similar products?', order: 6 }
+      ]
+    },
+    'feature-validation': {
+      name: 'Feature Validation',
+      description: 'Validate new features and gather requirements',
+      questions: [
+        { id: 1, category: 'INTRO', text: 'Hi, I\'m your interviewer. Ready to begin?', order: 1 },
+        { id: 2, category: 'WORKFLOW', text: 'Describe your current workflow for this type of task.', order: 2 },
+        { id: 3, category: 'PAIN_POINTS', text: 'What\'s the biggest bottleneck in your current process?', order: 3 },
+        { id: 4, category: 'SOLUTION', text: 'How would an ideal solution address that bottleneck?', order: 4 },
+        { id: 5, category: 'PRIORITY', text: 'How important is solving this problem compared to other challenges?', order: 5 },
+        { id: 6, category: 'ADOPTION', text: 'What would need to happen for you to adopt this new feature?', order: 6 }
+      ]
+    }
+  };
+
   useEffect(() => {
     const savedSettings = localStorage.getItem(`campaign-settings-${id}`);
     if (savedSettings) {
@@ -106,6 +147,16 @@ export default function InterviewSettings() {
 
   const updateSetting = (key: string, value: any) => {
     setSettings(prev => ({ ...prev, [key]: value }));
+  };
+
+  const applyStudyTemplate = (templateKey: string) => {
+    if (templateKey === 'custom') return;
+    const template = studyTemplates[templateKey as keyof typeof studyTemplates];
+    if (template) {
+      setQuestions(template.questions);
+      updateSetting('questionCount', template.questions.length);
+      updateSetting('studyTemplate', templateKey);
+    }
   };
 
   const startEditingQuestion = (questionId: number, currentText: string) => {
@@ -294,12 +345,37 @@ export default function InterviewSettings() {
               </div>
             </div>
             
-            <div className="grid md:grid-cols-2 gap-8">
+            <div className="grid md:grid-cols-3 gap-8">
+              <div className="space-y-4">
+                <h3 className="text-lg font-semibold text-white mb-3">Study Template</h3>
+                <select 
+                  value={settings.studyTemplate} 
+                  onChange={(e) => applyStudyTemplate(e.target.value)}
+                  className="w-full px-4 py-3 bg-white/10 border border-white/20 rounded-xl text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                >
+                  <option value="custom" className="bg-slate-800 text-white">Custom Questions</option>
+                  <option value="product-usability" className="bg-slate-800 text-white">Product Usability</option>
+                  <option value="pricing-research" className="bg-slate-800 text-white">Pricing Research</option>
+                  <option value="feature-validation" className="bg-slate-800 text-white">Feature Validation</option>
+                </select>
+                <p className="text-blue-200 text-sm">
+                  {settings.studyTemplate !== 'custom' && studyTemplates[settings.studyTemplate as keyof typeof studyTemplates]?.description}
+                </p>
+              </div>
+              
               <div className="space-y-4">
                 <h3 className="text-lg font-semibold text-white mb-3">LLM Mode</h3>
                 <ModeToggle 
                   value={settings.llmMode}
-                  onChange={(mode) => updateSetting('llmMode', mode)}
+                  onChange={(mode) => {
+                    const cloudOK = !!process.env.NEXT_PUBLIC_USE_CLOUD;
+                    if (mode === 'cloud' && !cloudOK) {
+                      try { (window as any).toast?.('Cloud mode needs API keys'); } catch {}
+                      if (typeof window !== 'undefined') alert('Cloud mode needs API keys');
+                      return;
+                    }
+                    updateSetting('llmMode', mode);
+                  }}
                 />
                 <div className="space-y-2 text-sm">
                   <p className="text-blue-200"><strong>Local:</strong> Fast, private, limited capabilities</p>

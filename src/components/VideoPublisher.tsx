@@ -482,7 +482,7 @@ export default function VideoPublisher({ sessionId, firebaseSessionId }: VideoPu
         </Button>
 
         {recStatus !== "rec" ? (
-          <Button onClick={startRecording} size="xl" cta="cyan" shadow className={tile} aria-label="Start Recording">
+          <Button onClick={startRecording} size="xl" cta="cyan" shadow className={tile} aria-label="Start Recording" disabled={recStatus === "stopping"}>
             <span className={icon}>⏺️</span>
             <span className={label}>
               <span className="block">Start</span>
@@ -507,7 +507,7 @@ export default function VideoPublisher({ sessionId, firebaseSessionId }: VideoPu
 
 
       {/* Status Messages */}
-      {viewerLink && live && (
+      {viewerLink && live && signalingAvailable() && (
         <div className="bg-green-900/20 border border-green-700/30 rounded-lg p-4 mb-4">
           <div className="flex items-center gap-3">
             <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>

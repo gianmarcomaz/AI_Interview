@@ -28,7 +28,25 @@ export default function AgentPane({
     // Use the selected TTS voice and language from the session
     speak(currentQuestion.text, lang, ttsVoice);
   };
-  
+
+  // Enhanced question text with warm, conversational tone
+  const getWarmQuestionText = (question: string) => {
+    const warmPrefixes = [
+      "Thanks for that. ",
+      "Great answer. ",
+      "I appreciate that insight. ",
+      "That's helpful. ",
+      "Interesting perspective. "
+    ];
+    
+    // For follow-up questions, add warm prefix
+    if (question.includes('Could you') || question.includes('How did you') || question.includes('What drove')) {
+      return warmPrefixes[Math.floor(Math.random() * warmPrefixes.length)] + question;
+    }
+    
+    return question;
+  };
+
   return (
     <div className="bg-white/10 backdrop-blur-lg rounded-3xl border border-white/20 p-6 h-full shadow-glow">
       <div className="flex items-center gap-4 mb-6">
@@ -45,7 +63,9 @@ export default function AgentPane({
               {currentQuestion.category}
             </span>
           </div>
-          <div className="text-xl text-white leading-relaxed font-medium">{currentQuestion.text}</div>
+          <div className="text-xl text-white leading-relaxed font-medium">
+            {getWarmQuestionText(currentQuestion.text)}
+          </div>
         </div>
       </div>
       
@@ -86,4 +106,20 @@ export default function AgentPane({
       {/* Info section removed to keep the card compact */}
     </div>
   );
+}
+
+// Tiny helper to speak short acknowledgements right after user finishes
+export function speakBackchannel() {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+  const phrases = [
+    'Got it.',
+    'Thanks — let me think.',
+    'Okay.',
+    "I see.",
+  ];
+  const utter = new SpeechSynthesisUtterance(phrases[Math.floor(Math.random()*phrases.length)]);
+  utter.rate = 0.95;
+  utter.pitch = 1.0;
+  utter.volume = 1.0;
+  try { window.speechSynthesis.speak(utter); } catch {}
 }

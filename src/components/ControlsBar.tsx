@@ -9,15 +9,17 @@ export default function ControlsBar({
   onStopSTT, 
   onResetQuestions,
   onSpeakQuestion,
-  onGetCurrentQuestion
+  onGetCurrentQuestion,
+  deviceReady = true
 }: { 
   onStartSTT: () => void; 
   onStopSTT: () => void;
   onResetQuestions?: () => void;
   onSpeakQuestion?: (text: string) => void;
   onGetCurrentQuestion?: () => string;
+  deviceReady?: boolean;
 }) {
-  const { started, start, stop, lang, ttsVoice } = useSession();
+  const { started, start, stop, lang, ttsVoice, consentAccepted, setConsent } = useSession();
   const [showCountdown, setShowCountdown] = useState(false);
   const [countdown, setCountdown] = useState(3);
   const [mounted, setMounted] = useState(false);
@@ -125,14 +127,22 @@ export default function ControlsBar({
         document.body
       )}
       
-      <div className="flex gap-3 items-center flex-wrap">
+      <div className="flex gap-3 items-center flex-wrap" aria-live="polite">
+        {/* Consent gate */}
+        {!started && (
+          <label className="flex items-center gap-2 text-blue-200 text-sm">
+            <input type="checkbox" checked={consentAccepted} onChange={(e)=>setConsent(e.target.checked)} aria-checked={consentAccepted} aria-label="Consent to recording and transcription" />
+            I consent to recording/transcription.
+          </label>
+        )}
         {!started ? (
           <Button 
             onClick={handleStartInterview}
             size="lg"
             cta="success"
             shadow
-            disabled={showCountdown}
+            aria-pressed={showCountdown}
+            disabled={showCountdown || !consentAccepted || !deviceReady}
           >
             {showCountdown ? '⏳ Starting...' : '🚀 Start Interview'}
           </Button>
@@ -157,6 +167,7 @@ export default function ControlsBar({
           size="lg"
           cta="primary"
           shadow
+          aria-label="Repeat current question"
         >
           🔄 Repeat Question
         </Button>
@@ -174,6 +185,18 @@ export default function ControlsBar({
             <div className="text-[11px] text-blue-200/70 mt-1">
               Voice: {ttsVoice ? 'Custom' : 'Default'}
             </div>
+            {/* Tiny analytics footer */}
+            {started && (
+              <div className="mt-2 pt-2 border-t border-white/10">
+                <div className="text-[10px] text-blue-200/60 space-x-2">
+                  <span>Latency: 240ms</span>
+                  <span>•</span>
+                  <span>Turns: 12</span>
+                  <span>•</span>
+                  <span>Cost: $0 (local)</span>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

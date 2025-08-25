@@ -23,6 +23,7 @@ export default function ReportsClient({
       .slice(-10)
       .map((t: any) => ({ ts: t.ts, text: t.text })),
   };
+  const canExport = Boolean(data.summary || (data.quotes && data.quotes.length));
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900">
@@ -43,10 +44,10 @@ export default function ReportsClient({
             <h2 className="text-white font-semibold">Export</h2>
           </div>
           <div className="flex gap-3">
-            <button className="h-12 px-5 rounded-xl bg-gradient-to-r from-blue-600 to-purple-600 text-white font-semibold hover:from-blue-700 hover:to-purple-700 shadow-glow" onClick={() => pdfReport(data)}>
+            <button className="h-12 px-5 rounded-xl bg-gradient-to-r from-blue-600 to-purple-600 text-white font-semibold hover:from-blue-700 hover:to-purple-700 shadow-glow disabled:opacity-50 disabled:cursor-not-allowed" onClick={() => pdfReport(data)} disabled={!canExport}>
               Generate PDF
             </button>
-            <button className="h-12 px-5 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-semibold hover:from-indigo-700 hover:to-violet-700 shadow-glow" onClick={() => pptReport(data)}>
+            <button className="h-12 px-5 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-semibold hover:from-indigo-700 hover:to-violet-700 shadow-glow disabled:opacity-50 disabled:cursor-not-allowed" onClick={() => pptReport(data)} disabled={!canExport}>
               Generate PowerPoint
             </button>
           </div>

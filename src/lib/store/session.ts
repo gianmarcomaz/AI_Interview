@@ -70,11 +70,14 @@ type State = {
   tagTally: Record<string, number>;
   // Multilingual support
   ttsVoice?: string;
+  // Consent gate
+  consentAccepted: boolean;
   setCampaign(id?: string): void;
   setMode(m: 'structured'|'conversational'): void;
   setLLMMode(m: 'local'|'cloud'|'rules'): void;
   setLang(lang: string): void;
   setTtsVoice(v?: string): void;
+  setConsent(v: boolean): void;
   start(): void; 
   stop(): void;
   setPartial(t: string): void;
@@ -104,12 +107,14 @@ export const useSession = create<State>((set, get) => ({
   lastLatencyMs: undefined,
   tagTally: {},
   ttsVoice: undefined,
+  consentAccepted: false,
 
   setCampaign(id) { set({ campaignId: id }); },
   setMode(m) { set({ mode: m }); },
   setLLMMode(m) { set({ llmMode: m }); },
   setLang(lang) { set({ lang }); },
   setTtsVoice(v) { set({ ttsVoice: v }); },
+  setConsent(v) { set({ consentAccepted: v }); },
   start() { set({ started: true, finished: false, qIndex: 0, askedIds: [], currentQ: pickInitial(), transcript: [], partial: '', lastAnswer: undefined }); },
   stop() { set({ started: false, partial: '' }); },
   setPartial(t) { set({ partial: t }); },
