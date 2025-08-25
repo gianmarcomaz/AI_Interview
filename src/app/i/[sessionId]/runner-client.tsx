@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback, useTransition } from 'react';
 import { useSearchParams, useParams } from 'next/navigation';
 import { useSession } from '@/lib/store/session';
 import { startSTT } from '@/lib/stt/webspeech';
+import { startVAD } from '@/lib/audio/vad';
 import ControlsBar from '@/components/ControlsBar';
 import AgentPane from '@/components/AgentPane';
 import TranscriptPane from '@/components/TranscriptPane';
@@ -46,9 +47,146 @@ export default function InterviewClient() {
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [firebaseSessionId, setFirebaseSessionId] = useState<string | null>(null);
   const [deviceReady, setDeviceReady] = useState(false);
+  const [sttError, setSttError] = useState<string | null>(null);
 
   // Transition to keep UI responsive on button clicks
   const [isPending, startTransition] = useTransition();
+
+  // Follow-up question queue for smart, adaptive interviewing
+  const [followUpQueue, setFollowUpQueue] = useState<string[]>([]);
+
+  // Micro-acknowledgement phrases for human-like interaction
+  const ACKS = ['Got it.', 'Thanks.', 'Okay.', 'Understood.', 'I see.', 'Right.'];
+  
+  // Timing constants for natural interview flow
+  const SOFT_MS = 40_000;  // 40s soft cap - natural pause point
+  const HARD_MS = 90_000;  // 90s hard cap - maximum response time
+  const MIN_SPEECH_MS = 6_000;  // 6s minimum speech before auto-advance
+  
+  // Turn timing state
+  const turnStartedAtRef = useRef<number>(0);
+  const lastSpeechAtRef = useRef<number>(0);
+  const vadStopRef = useRef<(() => void) | null>(null);
+  
+  // Smart follow-up questions (zero-cost heuristics)
+  const rulesFollowup = (answer: string): string | null => {
+    const s = answer.toLowerCase();
+    if (/\d/.test(s)) return 'What drove that number?';
+    if (/cache|latency|throughput|scale|performance/.test(s)) return 'How did you measure the impact?';
+    if (s.split(/\s+/).length < 10) return 'Could you share a concrete example?';
+    if (/problem|challenge|issue/.test(s)) return 'What was the root cause? How did you identify it?';
+    if (/result|outcome|impact/.test(s)) return 'How did you measure success? What were the key metrics?';
+    return null;
+  };
+
+  // Helper function to configure TTS with consistent voice settings
+  const configureTTSVoice = (utterance: SpeechSynthesisUtterance) => {
+    // Get the selected TTS voice from the session store
+    const { ttsVoice } = useSession.getState();
+    
+    if (ttsVoice && ttsVoice !== 'default') {
+      // Find the specific voice
+      const voices = window.speechSynthesis.getVoices();
+      const selectedVoice = voices.find(v => v.voiceURI === ttsVoice);
+      if (selectedVoice) {
+        utterance.voice = selectedVoice;
+        console.log('🎤 Using selected TTS voice:', selectedVoice.name);
+        return true; // Voice was set
+      }
+    }
+    return false; // Using default voice
+  };
+
+  // --- Manual+ Half-duplex primitives ---
+  const turnRef = useRef<'idle'|'tts'|'stt'>('idle');
+
+  function speakAsync(text: string, opts: { rate?: number; pitch?: number } = {}) {
+    return new Promise<void>((resolve) => {
+      const u = new SpeechSynthesisUtterance(text);
+      // Configure voice for consistency
+      try { configureTTSVoice(u); } catch {}
+      u.rate = opts.rate ?? 1.0;
+      u.pitch = opts.pitch ?? 1.0;
+      u.onstart = () => { turnRef.current = 'tts'; stopMic(); };
+      u.onend = () => { setTimeout(() => { turnRef.current = 'idle'; resolve(); }, 300); };
+      u.onerror = () => { turnRef.current = 'idle'; resolve(); };
+      try { window.speechSynthesis.cancel(); } catch {}
+      try { window.speechSynthesis.speak(u); } catch { resolve(); }
+    });
+  }
+
+  async function beep(ms = 120, freq = 880, vol = 0.03) {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.value = vol;
+      osc.connect(gain).connect(ctx.destination);
+      osc.start();
+      setTimeout(() => { try { osc.stop(); ctx.close(); } catch {} }, ms);
+    } catch {}
+  }
+
+  function waitForSilence(ms = 600) {
+    return new Promise<void>((resolve) => {
+      const tick = () => (performance.now() - lastSpeechAtRef.current > ms ? resolve() : setTimeout(tick, 100));
+      tick();
+    });
+  }
+
+  // Auto-advance functionality with micro-acknowledgements
+  const speakAck = async () => { await beep(100, 660); };
+
+  const autoNext = () => {
+    // Only auto-advance if we're not at the last question
+    if (currentQuestionIndex < totalQuestions - 1) {
+      console.log('🤖 Auto-advancing to next question...');
+      nextQuestion();
+    } else {
+      console.log('🎉 Interview completed, no more questions to advance to');
+    }
+  };
+
+  const maybeAutoAdvance = () => {
+    const now = performance.now();
+    const spokeLongEnough = (now - turnStartedAtRef.current) > MIN_SPEECH_MS;
+    const withinSoft = (now - turnStartedAtRef.current) < SOFT_MS;
+    
+    if (spokeLongEnough && currentQuestionIndex < totalQuestions - 1) {
+      console.log('🤖 Triggering auto-advance sequence (beta)...');
+      // Auto-advance is gated by a toggle; default off
+      const AUTO = false; // TODO: wire to UI toggle if desired
+      if (!AUTO) return;
+      speakAck();
+      // Tiny pause feels natural, longer pause for longer responses
+      setTimeout(autoNext, withinSoft ? 300 : 0);
+    } else if (currentQuestionIndex >= totalQuestions - 1) {
+      console.log('🎉 At final question, skipping auto-advance');
+    } else {
+      console.log('⏱️ Response too short for auto-advance');
+    }
+  };
+
+  const softNudge = () => {
+    const now = performance.now();
+    if (now - turnStartedAtRef.current > 60_000) {
+      // Only nudge if still speaking recently (within last 10s)
+      const recentlySpoke = (now - lastSpeechAtRef.current) < 10_000;
+      if (recentlySpoke) {
+        console.log('🤖 Soft nudge: reminding about time limit');
+        // Use speakQuestion to ensure voice consistency
+        speakQuestion('Take your time—about twenty seconds left.');
+      }
+    }
+  };
+
+  const hardAdvance = () => {
+    console.log('⏰ Hard time limit reached, forcing advance');
+    // Respect same gating; hard cap still forces next silently
+    setTimeout(() => autoNext(), 200);
+  };
 
   // Memoized current question getter (placed before handlers that depend on it)
   const getCurrentQuestion = useCallback(() => {
@@ -123,7 +261,22 @@ export default function InterviewClient() {
       if (partialUpdateTimeoutRef.current) {
         clearTimeout(partialUpdateTimeoutRef.current);
       }
+      if (vadStopRef.current) {
+        vadStopRef.current();
+      }
     };
+  }, []);
+
+  // Ensure TTS voices are loaded for consistent voice selection
+  useEffect(() => {
+    if ('speechSynthesis' in window) {
+      // Load voices if not already loaded
+      if (window.speechSynthesis.getVoices().length === 0) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          console.log('🎤 TTS voices loaded:', window.speechSynthesis.getVoices().length);
+        };
+      }
+    }
   }, []);
 
   const createFirebaseSession = async () => {
@@ -202,50 +355,11 @@ export default function InterviewClient() {
       return;
     }
     
-    // If we have an existing session, ask user if they want to start fresh
-    if (firebaseSessionId) {
-      const startFresh = window.confirm(
-        'You already have an interview session. Would you like to start a completely new interview?'
-      );
-      
-      if (startFresh) {
-        // Reset everything for new interview
-        console.log('🔄 Starting fresh interview...');
-        
-        // Stop any existing recording first
-        if (stopRef.current) {
-          try {
-            (stopRef.current as () => void)();
-          } catch (error) {
-            console.error('Error stopping recording:', error);
-          }
-        }
-        stopRef.current = null;
-        
-        // Reset session state
-        setFirebaseSessionId(null);
-        setCurrentQuestionIndex(0);
-        setCampaignQuestions([]);
-        setTranscriptHistory([]); // Clear transcript history
-        lastSavedPartialRef.current = ''; // Clear last saved partial for fresh start
-        savedTranscriptsRef.current.clear(); // Clear saved transcripts for fresh start
-        
-        // Clear any pending partial update timeout
-        if (partialUpdateTimeoutRef.current) {
-          clearTimeout(partialUpdateTimeoutRef.current);
-          partialUpdateTimeoutRef.current = null;
-        }
-        
-        // Load campaign questions again
-        if (campaignParam) {
-          const questions = loadCampaignQuestions(campaignParam);
-          setCampaignQuestions(questions);
-        }
-      } else {
-        // Continue with existing session
-        console.log('📝 Continuing with existing session...');
-      }
-    }
+    // Clear any previous errors when starting
+    setSttError(null);
+    // Do not show any start-over confirmation here; this function is used for
+    // routine TTS↔STT handoffs during a session. A brand-new session is created
+    // automatically if firebaseSessionId is null (handled below).
     
     // CRITICAL FIX: Get the current session ID and ensure it's available
     let currentSessionId = firebaseSessionId;
@@ -277,11 +391,62 @@ export default function InterviewClient() {
     }
     
     try {
+      // Start VAD for better speech detection
+      if (currentSessionId) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              channelCount: 1,
+              sampleRate: 48000
+            }
+          });
+          
+          // Clean up any existing VAD
+          if (vadStopRef.current) {
+            vadStopRef.current();
+          }
+          
+          // Start VAD with proper timing
+          vadStopRef.current = startVAD(stream, {
+            onSpeech: () => { 
+              lastSpeechAtRef.current = performance.now(); 
+              console.log('🎤 VAD: Speech detected');
+            },
+            onSilence: () => { 
+              console.log('🔇 VAD: Silence detected');
+              // VAD silence triggers STT idle timer, which will handle finalization
+            }
+          }, { 
+            energyThreshold: 0.015,
+            minSpeechMs: 120,
+            minSilenceMs: 500
+          });
+          
+          console.log('🎤 VAD started with audio constraints');
+        } catch (vadError) {
+          console.warn('⚠️ VAD setup failed, falling back to basic STT:', vadError);
+        }
+      }
+      
+      // Initialize turn timing
+      turnStartedAtRef.current = performance.now();
+      lastSpeechAtRef.current = turnStartedAtRef.current;
+      
+      // Set up soft/hard timers
+      const softTimer = setTimeout(() => softNudge(), 60_000);  // 60s soft nudge
+      const hardTimer = setTimeout(() => hardAdvance(), HARD_MS);  // 90s hard cap
+      
       stopRef.current = startSTT(
         (t) => { 
           console.log('🎤 Partial transcript received:', t);
           setPartialLocal(t); 
           setPartial(t); 
+          
+          // Update last speech time on any partial
+          lastSpeechAtRef.current = performance.now();
           
           // Debounce partial transcript saving to reduce Firebase writes
           if (currentSessionId && t.trim()) {
@@ -336,12 +501,115 @@ export default function InterviewClient() {
               savedTranscriptsRef.current.add(finalText); // Add to saved set
             }
           }
+          
+          // Check for smart follow-up question
+          const followUp = rulesFollowup(t);
+          if (followUp) {
+            console.log('🤖 Smart follow-up detected:', followUp);
+            // Enqueue the follow-up question
+            setFollowUpQueue(prev => [...prev, followUp]);
+          }
+          
+          // Auto-advance after final transcript (only if not at last question)
+          if (currentQuestionIndex < totalQuestions - 1) {
+            maybeAutoAdvance();
+          }
+          
+          // Clear timers since we got a final result
+          clearTimeout(softTimer);
+          clearTimeout(hardTimer);
         },
-        lang
+        lang,
+        // VAD-lite: silence without a 'final' (e.g., short utterance) → finalize any partial and advancing
+        () => {
+          console.log('🔇 VAD-lite: Silence detected, finalizing partial and advancing...');
+          
+          // Only process if we have partial text and not at last question
+          if (partial.trim() && currentQuestionIndex < totalQuestions - 1) { 
+            console.log('📝 Finalizing partial transcript from silence:', partial.substring(0, 50) + '...');
+            pushFinal(partial, Date.now()); 
+            setPartialLocal(''); 
+            
+            // Check for smart follow-up question
+            const followUp = rulesFollowup(partial);
+            if (followUp) {
+              console.log('🤖 Smart follow-up detected from partial:', followUp);
+              setFollowUpQueue(prev => [...prev, followUp]);
+            }
+            
+            // Auto-advance after processing partial
+            maybeAutoAdvance();
+          } else if (currentQuestionIndex >= totalQuestions - 1) {
+            console.log('🎉 At final question, skipping auto-advance from silence');
+          } else {
+            console.log('🔇 Silence detected but no partial text to process');
+          }
+          
+          // Clear timers since silence was detected
+          clearTimeout(softTimer);
+          clearTimeout(hardTimer);
+        }
       );
+      
+      // Store cleanup function that also clears timers
+      const originalStop = stopRef.current;
+      stopRef.current = () => {
+        clearTimeout(softTimer);
+        clearTimeout(hardTimer);
+        if (originalStop) originalStop();
+      };
+      
     } catch (error) {
-      console.error('STT Error:', error);
-      alert('Speech recognition not available. Please use Chrome browser.');
+      console.error('STT Setup Error:', error);
+      
+      // Provide user-friendly error messages based on error type
+      let userMessage = 'Speech recognition not available. Please use Chrome browser.';
+      
+      if (error instanceof Error) {
+        if (error.message.includes('Browser STT not available')) {
+          userMessage = 'Speech recognition not supported in this browser. Please use Chrome or Edge.';
+        } else if (error.message.includes('client only')) {
+          userMessage = 'Speech recognition can only be used in the browser.';
+        } else if (error.name === 'NotAllowedError' || error.message.includes('Permission denied')) {
+          userMessage = 'Microphone access denied. Please allow microphone permissions in your browser settings.';
+        } else if (error.message.includes('getUserMedia')) {
+          userMessage = 'Microphone access failed. Please check your microphone permissions and try again.';
+        } else if (error.message.includes('NotSupportedError')) {
+          userMessage = 'Your device does not support the required audio features. Please try a different device.';
+        } else if (error.message.includes('NotReadableError')) {
+          userMessage = 'Microphone is already in use by another application. Please close other apps using the microphone.';
+        } else {
+          userMessage = `Speech recognition error: ${error.message}`;
+        }
+      } else if (typeof error === 'string') {
+        // Handle string errors
+        if (error.includes('permission') || error.includes('denied')) {
+          userMessage = 'Microphone access denied. Please allow microphone permissions.';
+        } else if (error.includes('not supported')) {
+          userMessage = 'Speech recognition not supported in this browser.';
+        } else {
+          userMessage = `Speech recognition error: ${error}`;
+        }
+      } else if (error && typeof error === 'object') {
+        // Handle object errors
+        const errorObj = error as any;
+        if (errorObj.error === 'not-allowed') {
+          userMessage = 'Microphone access denied. Please allow microphone permissions.';
+        } else if (errorObj.error === 'audio-capture') {
+          userMessage = 'Audio capture failed. Please check your microphone and try again.';
+        } else if (errorObj.error === 'network') {
+          userMessage = 'Network error during speech recognition. Please check your internet connection.';
+        } else if (errorObj.message) {
+          userMessage = `Speech recognition error: ${errorObj.message}`;
+        }
+      }
+      
+      // Set error state for UI display
+      setSttError(userMessage);
+      
+      // Reset state to allow retry
+      stopRef.current = null;
+      console.log('🔄 STT setup failed, user can retry');
     }
     
     // Note: First question speaking is handled by ControlsBar after countdown
@@ -356,27 +624,40 @@ export default function InterviewClient() {
         stopFunction();
       }
       stopRef.current = null;
-      
-      // Clear any pending partial update timeout
-      if (partialUpdateTimeoutRef.current) {
-        clearTimeout(partialUpdateTimeoutRef.current);
-        partialUpdateTimeoutRef.current = null;
-      }
-      
-      // Track session minutes
-      if (campaignParam && sessionStartRef.current) {
-        addSessionMinutes(campaignParam, Date.now() - sessionStartRef.current);
-        sessionStartRef.current = null;
-      }
-
-      // Update Firebase session status to completed
-      if (firebaseSessionId) {
-        InterviewService.updateSessionStatus(firebaseSessionId, {
-          status: 'completed',
-          endedAt: new Date().toISOString()
-        });
-      }
     }
+    
+    // Clean up VAD
+    if (vadStopRef.current) {
+      vadStopRef.current();
+      vadStopRef.current = null;
+    }
+    
+    // Clear any pending partial update timeout
+    if (partialUpdateTimeoutRef.current) {
+      clearTimeout(partialUpdateTimeoutRef.current);
+      partialUpdateTimeoutRef.current = null;
+    }
+    
+    // Reset timing state
+    turnStartedAtRef.current = 0;
+    lastSpeechAtRef.current = 0;
+    
+    // Track session minutes
+    if (campaignParam && sessionStartRef.current) {
+      addSessionMinutes(campaignParam, Date.now() - sessionStartRef.current);
+      sessionStartRef.current = null;
+    }
+
+    // Update Firebase session status to completed
+    if (firebaseSessionId) {
+      InterviewService.updateSessionStatus(firebaseSessionId, {
+        status: 'completed',
+        endedAt: new Date().toISOString()
+      });
+    }
+
+    // Clear the session ID so the next Start creates a fresh session
+    setFirebaseSessionId(null);
   };
 
   // Save transcript segment to Firebase
@@ -472,20 +753,20 @@ export default function InterviewClient() {
   const isInterviewCompleted = currentQuestionIndex >= totalQuestions - 1;
 
   const nextQuestion = useCallback(() => {
-    if (currentQuestionIndex < totalQuestions - 1) {
-      // Save current question to Firebase before moving to next
-      const currentQuestion = getCurrentQuestion();
-      if (firebaseSessionId && currentQuestion.text) {
-        // Ensure category exists and is a string before calling toLowerCase()
-        const questionCategory = currentQuestion.category || 'behavioral';
-        // Fire-and-forget to avoid blocking UI thread
-        setTimeout(() => {
-          void saveQuestionToFirebase(currentQuestion.text, questionCategory.toLowerCase());
-        }, 0);
-      }
-
-      // Move to next question
-      const newIndex = currentQuestionIndex + 1;
+     if (currentQuestionIndex < totalQuestions - 1) {
+       // Save current question to Firebase before moving to next
+       const currentQuestion = getCurrentQuestion();
+       if (firebaseSessionId && currentQuestion.text) {
+         // Ensure category exists and is a string before calling toLowerCase()
+         const questionCategory = currentQuestion.category || 'behavioral';
+         // Fire-and-forget to avoid blocking UI thread
+         setTimeout(() => {
+           void saveQuestionToFirebase(currentQuestion.text, questionCategory.toLowerCase());
+         }, 0);
+       }
+ 
+      // Move to the next question deterministically (+1)
+      const newIndex = Math.min(currentQuestionIndex + 1, totalQuestions - 1);
       startTransition(() => {
         setCurrentQuestionIndex(newIndex);
       });
@@ -561,62 +842,62 @@ export default function InterviewClient() {
         }, 0);
       }
     }
-  }, [currentQuestionIndex, totalQuestions, firebaseSessionId, getCurrentQuestion]);
+  }, [currentQuestionIndex, totalQuestions, firebaseSessionId, getCurrentQuestion, campaignQuestions]);
 
   const previousQuestion = useCallback(() => {
-    if (currentQuestionIndex > 0) {
-      // Move to previous question
-      const newIndex = currentQuestionIndex - 1;
-      startTransition(() => {
-        setCurrentQuestionIndex(newIndex);
-      });
-      
-      // Add timeline event
-      if (firebaseSessionId) {
-        setTimeout(() => {
-          void InterviewService.addTimelineEvent(firebaseSessionId!, {
-            type: 'question_retreated',
-            data: { from: currentQuestionIndex, to: newIndex }
-          });
-        }, 0);
-      }
-      
-      console.log(`⬅️ Returned to question ${newIndex + 1}/${totalQuestions}`);
-      
-      // Get the question text from campaign questions or fallback to defaults
-      let previousQuestionText: string;
-      
-      if (campaignQuestions.length > 0 && newIndex < campaignQuestions.length) {
-        // Use campaign question
-        previousQuestionText = campaignQuestions[newIndex].text;
-        console.log(`📝 Using campaign question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
-      } else {
-        // Fallback to default questions
-        previousQuestionText = newIndex === 0 
-          ? 'Give me a 30-second overview of your background and experience.'
-          : newIndex === 1
-          ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
-          : newIndex === 2
-          ? 'Describe a challenging project you worked on and how you overcame obstacles.'
-          : newIndex === 3
-          ? 'Where do you see yourself professionally in the next 3-5 years?'
-          : newIndex === 4
-          ? 'What motivates you to do your best work?'
-          : newIndex === 5
-          ? 'Tell me about a time you had to learn something new quickly.'
-          : newIndex === 6
-          ? 'How do you handle feedback and criticism?'
-          : 'What questions do you have for me about this role or company?';
-        console.log(`📝 Using default question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
-      }
-      
-      // Speak the question after a short delay to ensure state is updated
-      setTimeout(() => {
-        console.log(`🎤 Speaking question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
-        speakQuestion(previousQuestionText);
-      }, 160);
-    }
-  }, [currentQuestionIndex, totalQuestions, campaignQuestions, firebaseSessionId]);
+     if (currentQuestionIndex > 0) {
+       // Move to previous question
+      const newIndex = Math.max(currentQuestionIndex - 1, 0);
+       startTransition(() => {
+         setCurrentQuestionIndex(newIndex);
+       });
+       
+       // Add timeline event
+       if (firebaseSessionId) {
+         setTimeout(() => {
+           void InterviewService.addTimelineEvent(firebaseSessionId!, {
+             type: 'question_retreated',
+             data: { from: currentQuestionIndex, to: newIndex }
+           });
+         }, 0);
+       }
+       
+       console.log(`⬅️ Returned to question ${newIndex + 1}/${totalQuestions}`);
+       
+       // Get the question text from campaign questions or fallback to defaults
+       let previousQuestionText: string;
+       
+       if (campaignQuestions.length > 0 && newIndex < campaignQuestions.length) {
+         // Use campaign question
+         previousQuestionText = campaignQuestions[newIndex].text;
+         console.log(`📝 Using campaign question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
+       } else {
+         // Fallback to default questions
+         previousQuestionText = newIndex === 0 
+           ? 'Give me a 30-second overview of your background and experience.'
+           : newIndex === 1
+           ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
+           : newIndex === 2
+           ? 'Describe a challenging project you worked on and how you overcame obstacles.'
+           : newIndex === 3
+           ? 'Where do you see yourself professionally in the next 3-5 years?'
+           : newIndex === 4
+           ? 'What motivates you to do your best work?'
+           : newIndex === 5
+           ? 'Tell me about a time you had to learn something new quickly.'
+           : newIndex === 6
+           ? 'How do you handle feedback and criticism?'
+           : 'What questions do you have for me about this role or company?';
+         console.log(`📝 Using default question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
+       }
+       
+       // Speak the question after a short delay to ensure state is updated
+       setTimeout(() => {
+         console.log(`🎤 Speaking question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
+         speakQuestion(previousQuestionText);
+       }, 160);
+     }
+   }, [currentQuestionIndex, totalQuestions, campaignQuestions, firebaseSessionId, InterviewService]);
 
   
 
@@ -640,53 +921,57 @@ export default function InterviewClient() {
   }, [firebaseSessionId]);
 
   // AI Voice function to speak questions
-  const speakQuestion = (questionText: string) => {
+  const speakQuestion = async (questionText: string) => {
     if ('speechSynthesis' in window) {
       // Stop any current speech gracefully
       if (window.speechSynthesis.speaking) {
         window.speechSynthesis.cancel();
         // Small delay to ensure clean stop
-        setTimeout(() => {
-          speakQuestionInternal(questionText);
-        }, 100);
+        await new Promise(r=>setTimeout(r,100));
       } else {
-        speakQuestionInternal(questionText);
+        // wait
       }
+      // Wait for brief silence before speaking to avoid talk-over
+      await waitForSilence(600);
+      speakQuestionInternal(questionText);
     } else {
       console.warn('⚠️ Speech synthesis not supported in this browser');
     }
   };
 
-  // Internal TTS function with proper error handling
+  // Internal TTS function with proper error handling and barge-in rules
   const speakQuestionInternal = (questionText: string) => {
     try {
       const utterance = new SpeechSynthesisUtterance(questionText);
       
-      // Get the selected TTS voice from the session store
-      const { ttsVoice } = useSession.getState();
-      
-      if (ttsVoice && ttsVoice !== 'default') {
-        // Find the specific voice
-        const voices = window.speechSynthesis.getVoices();
-        const selectedVoice = voices.find(v => v.voiceURI === ttsVoice);
-        if (selectedVoice) {
-          utterance.voice = selectedVoice;
-          console.log('🎤 Using selected TTS voice:', selectedVoice.name);
-        }
-      }
+      // Configure voice settings for consistency
+      configureTTSVoice(utterance);
       
       // Configure speech parameters for clear interview questions
       utterance.rate = 0.9; // Slightly slower for clarity
       utterance.pitch = 1.0;
       utterance.volume = 1.0;
       
-      // Add event handlers with better error handling
+      // Barge-in rules: stop STT when TTS starts, resume when it ends
       utterance.onstart = () => {
         console.log('🎤 AI speaking question:', questionText.substring(0, 50) + '...');
+        // Stop STT to prevent double-talk
+        if (stopRef.current) {
+          console.log('🔇 Stopping STT for TTS (barge-in rule)');
+          stopRef.current();
+          stopRef.current = null;
+        }
       };
       
       utterance.onend = () => {
         console.log('✅ AI finished speaking question');
+        // Resume STT listening after a short delay to ensure clean transition
+        setTimeout(() => {
+          if (!stopRef.current) {
+            console.log('🎤 Resuming STT after TTS (barge-in rule)');
+            startMic();
+          }
+        }, 300);
       };
       
       utterance.onerror = (event) => {
@@ -710,12 +995,26 @@ export default function InterviewClient() {
           default:
             console.error('❌ TTS Error:', event.error);
         }
+        // Resume STT on error after a delay
+        setTimeout(() => {
+          if (!stopRef.current) {
+            console.log('🎤 Resuming STT after TTS error (barge-in rule)');
+            startMic();
+          }
+        }, 200);
       };
       
       // Speak the question
       window.speechSynthesis.speak(utterance);
     } catch (error) {
       console.error('❌ Error setting up TTS:', error);
+      // Resume STT on error after a delay
+      setTimeout(() => {
+        if (!stopRef.current) {
+          console.log('🎤 Resuming STT after TTS setup error (barge-in rule)');
+          startMic();
+        }
+      }, 200);
     }
   };
 
@@ -798,29 +1097,55 @@ export default function InterviewClient() {
                   deviceReady={deviceReady}
                 />
               </div>
-              {/* Device check before starting */}
-              {!Boolean(stopRef.current) && (
-                <div className="mt-4">
-                  <DeviceCheck onStatusChange={setDeviceReady} />
-                </div>
-              )}
+               {/* Device check before starting */}
+               {!started && (
+                 <div className="mt-4">
+                   <DeviceCheck onStatusChange={setDeviceReady} />
+                 </div>
+               )}
+               
+               {/* STT Error Display and Retry */}
+               {sttError && (
+                 <div className="mt-4 p-4 bg-red-900/20 border border-red-700/30 rounded-xl">
+                   <div className="flex items-start gap-3">
+                     <div className="w-6 h-6 bg-red-500/20 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
+                       <span className="text-red-400 text-sm">⚠️</span>
+                     </div>
+                     <div className="flex-1">
+                       <p className="text-red-200 text-sm font-medium mb-2">Speech Recognition Error</p>
+                       <p className="text-red-300 text-xs mb-3">{sttError}</p>
+                       <button
+                         onClick={() => {
+                           setSttError(null);
+                           startMic();
+                         }}
+                         className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-medium rounded-lg transition-colors"
+                       >
+                         🔄 Retry
+                       </button>
+                     </div>
+                   </div>
+                 </div>
+               )}
             </div>
 
-            {/* Pro Tips compact card under controls */}
-            <div className="mt-6 p-5 bg-gradient-to-r from-blue-900/20 to-purple-900/20 rounded-2xl border border-blue-700/30">
-              <div className="flex items-start gap-3">
-                <div className="w-7 h-7 bg-yellow-500/20 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <span className="text-yellow-400 text-base">💡</span>
-                </div>
-                <div>
-                  <p className="text-blue-100 text-base font-semibold mb-2">Pro Tips for Best Results</p>
-                  <p className="text-blue-200 text-sm leading-relaxed">
-                    Use Chrome browser for optimal speech recognition. Click "Start" to begin, "Repeat" to re-ask questions,
-                    and "Next" to advance through the interview flow. Speak clearly and take your time with responses.
-                  </p>
+            {/* Pro Tips compact card (shown after interview starts) */}
+            {started && (
+              <div className="mt-6 p-5 bg-gradient-to-r from-blue-900/20 to-purple-900/20 rounded-2xl border border-blue-700/30">
+                <div className="flex items-start gap-3">
+                  <div className="w-7 h-7 bg-yellow-500/20 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5">
+                    <span className="text-yellow-400 text-base">💡</span>
+                  </div>
+                  <div>
+                    <p className="text-blue-100 text-base font-semibold mb-2">Pro Tips for Best Results</p>
+                    <p className="text-blue-200 text-sm leading-relaxed">
+                      Use Chrome browser for optimal speech recognition. Click "Start" to begin, "Repeat" to re-ask questions,
+                      and "Next" to advance through the interview flow. Speak clearly and take your time with responses.
+                    </p>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
           </div>
           <div className="lg:col-span-5">
             <div className="animate-fade-in-up" style={{ animationDelay: '0.05s' }}>
@@ -873,7 +1198,7 @@ export default function InterviewClient() {
               <div className="p-2 flex-1">
                 <TranscriptPane 
                   partial={partial} 
-                  listening={Boolean(stopRef.current)}
+                  listening={started}
                 />
               </div>
             </div>

@@ -1,28 +1,56 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
+import { useSession } from '@/lib/store/session';
 
 interface DeviceCheckProps {
   onStatusChange?: (ready: boolean) => void;
 }
 
 export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
+  const { ttsVoice } = useSession();
   const [ok, setOk] = useState<boolean | null>(null);
   const [level, setLevel] = useState(0);
   const [ttsTested, setTtsTested] = useState(false);
-  const audioRef = useRef<HTMLAudioElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+
+  // Helper function to configure TTS with consistent voice settings
+  const configureTTSVoice = (utterance: SpeechSynthesisUtterance) => {
+    if (ttsVoice && ttsVoice !== 'default') {
+      const voices = window.speechSynthesis.getVoices();
+      const selectedVoice = voices.find(v => v.voiceURI === ttsVoice);
+      if (selectedVoice) {
+        utterance.voice = selectedVoice;
+        console.log('🎤 DeviceCheck using selected TTS voice:', selectedVoice.name);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Ensure TTS voices are loaded for consistent voice selection
+  useEffect(() => {
+    if ('speechSynthesis' in window) {
+      // Load voices if not already loaded
+      if (window.speechSynthesis.getVoices().length === 0) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          console.log('🎤 DeviceCheck: TTS voices loaded:', window.speechSynthesis.getVoices().length);
+        };
+      }
+    }
+  }, []);
 
   useEffect(() => {
     (async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         streamRef.current = stream;
         setOk(true);
-        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const src = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 2048;
+        
+        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const analyser = audioContext.createAnalyser();
+        const src = audioContext.createMediaStreamSource(stream);
         src.connect(analyser);
         const data = new Uint8Array(analyser.frequencyBinCount);
         const loop = () => {
@@ -46,6 +74,10 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
   const testTTS = () => {
     if ('speechSynthesis' in window) {
       const utter = new SpeechSynthesisUtterance("Hi, I'm your interviewer. Ready to begin?");
+      
+      // Configure voice settings for consistency
+      configureTTSVoice(utter);
+      
       utter.rate = 0.9;
       utter.pitch = 1.0;
       utter.volume = 1.0;
@@ -66,7 +98,7 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
   return (
     <div className="p-6 rounded-2xl border border-white/20 bg-gradient-to-r from-white/5 to-white/10 mb-6">
       <div className="flex items-center justify-between mb-4">
-        <div className="text-white font-semibold text-lg">Device Check</div>
+        <div className="text-white font-semibold text-lg">Device Check (Test your devices before the interview)</div>
         <div className={`text-sm px-3 py-1 rounded-full ${
           allTestsPassed ? 'bg-green-600/20 text-green-300 border border-green-500/30' : 
           ok === false ? 'bg-red-600/20 text-red-300 border border-red-500/30' :

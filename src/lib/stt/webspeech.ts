@@ -1,6 +1,6 @@
-type PartialCb = (t: string) => void;
-type FinalCb = (t: string, ts: number) => void;
-type SilenceCb = () => void;
+export type PartialCb = (text: string) => void;
+export type FinalCb = (text: string, timestamp: number) => void;
+export type SilenceCb = () => void;
 
 interface SpeechRecognition extends EventTarget {
   continuous: boolean;
@@ -32,72 +32,126 @@ interface SpeechRecognitionAlternative {
   transcript: string;
 }
 
-export function startSTT(onPartial: PartialCb, onFinal: FinalCb, lang = "en-US", onSilence?: SilenceCb, silenceMs: number = 1000) {
+export function startSTT(
+  onPartial: PartialCb, 
+  onFinal: FinalCb, 
+  lang = "en-US", 
+  onSilence?: SilenceCb, 
+  silenceMs: number = 900
+) {
   if (typeof window === 'undefined') throw new Error('client only');
   const SR = (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognition; SpeechRecognition?: new () => SpeechRecognition }).webkitSpeechRecognition || 
              (window as unknown as { SpeechRecognition?: new () => SpeechRecognition }).SpeechRecognition;
-  if (!SR) throw new Error('Browser STT not available (use Chrome).');
+  if (!SR) throw new Error('Browser STT not supported (use Chrome).');
+  
   const rec = new SR();
   rec.continuous = true; 
   rec.interimResults = true; 
   rec.lang = lang;
   
-  let lastActivity = Date.now();
-  let silenceTimer: number | null = null;
-  let heartbeatInterval: number | null = null;
-  let listening = true;
-
-  function scheduleSilenceCheck() {
-    if (!onSilence) return;
-    if (silenceTimer) window.clearTimeout(silenceTimer);
-    silenceTimer = window.setTimeout(() => {
-      const now = Date.now();
-      if (listening && now - lastActivity >= silenceMs) {
-        onSilence();
-      }
-    }, silenceMs);
-  }
-
-  // Heartbeat mechanism for more responsive silence detection
-  function startHeartbeat() {
-    if (heartbeatInterval) window.clearInterval(heartbeatInterval);
-    heartbeatInterval = window.setInterval(() => {
-      if (listening && Date.now() - lastActivity > silenceMs) {
-        if (onSilence) onSilence();
-      }
-    }, 250); // Check every 250ms for responsiveness
-  }
-
-  rec.onresult = (e: SpeechRecognitionEvent) => {
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const r = e.results[i];
-      const txt = r[0]?.transcript?.trim() ?? '';
-      if (!txt) continue;
-      lastActivity = Date.now();
-      if (r.isFinal) {
-        onFinal(txt, Date.now());
-      } else {
-        onPartial(txt);
+  let idle: number | null = null;
+  let stopping = false;
+  
+  const bump = () => { 
+    if (idle) clearTimeout(idle); 
+    idle = window.setTimeout(() => safeStop(), silenceMs); 
+  };
+  
+  const safeStop = () => {
+    if (!stopping) {
+      stopping = true;
+      try {
+        // Detach handlers to avoid spurious onerror/onend after stop
+        rec.onend = null as any;
+        rec.onerror = null as any;
+        rec.stop();
+      } catch (e) {
+        console.log('STT stop error (normal):', e);
       }
     }
-    scheduleSilenceCheck();
   };
-
-  rec.onstart = () => {
-    listening = true;
-    lastActivity = Date.now();
-    startHeartbeat();
+  
+  rec.onresult = (e: SpeechRecognitionEvent) => {
+    // Use the latest available result for more reliable interim streaming
+    const results = (e as any).results as SpeechRecognitionResultList;
+    const r = results && results.length ? results[results.length - 1] : undefined;
+    if (!r) return;
+    const alt = r[0];
+    const text = alt?.transcript ?? '';
+    if (r.isFinal) {
+      onFinal(text, Date.now());
+    } else {
+      onPartial(text);
+    }
+    if (idle) clearTimeout(idle);
+    idle = window.setTimeout(() => {
+      try { onSilence?.(); } catch {}
+    }, silenceMs);
   };
-
-  rec.onend = () => {
-    listening = false;
+  
+  rec.onend = () => { 
+    if (idle) clearTimeout(idle); 
+    onSilence?.(); 
   };
-
+  
+  rec.onerror = (event: any) => {
+    // Web Speech API error event has different structure than standard Error
+    let errorMessage = 'Unknown STT error';
+    let errorCode = 'unknown';
+    const errorDetails: any = {};
+    
+    if (!event) {
+      errorMessage = 'No error event received';
+      errorCode = 'no-event';
+    } else if (typeof event === 'object') {
+      if ('error' in event && (event as any).error) {
+        errorCode = String((event as any).error);
+      }
+      if ('message' in event && (event as any).message) {
+        errorMessage = String((event as any).message);
+      }
+      if ('type' in event && (event as any).type && errorCode === 'unknown') {
+        errorCode = String((event as any).type);
+      }
+      // snapshot of event keys/values for debugging; never empty
+      try {
+        const keys = Object.keys(event as any);
+        errorDetails.keys = keys;
+        errorDetails.sample = keys.slice(0,3).reduce((acc:any,k)=>{acc[k]=(event as any)[k];return acc;}, {});
+        const json = JSON.stringify(event);
+        if (json && json !== '{}') errorDetails.json = json.substring(0,400);
+      } catch {}
+    } else {
+      errorMessage = String(event);
+      errorCode = 'non-object';
+    }
+    
+    // Ensure payload is never empty
+    const payload = {
+      errorCode,
+      errorMessage,
+      errorDetails: (errorDetails && Object.keys(errorDetails).length ? errorDetails : { note: 'no-structured-details' }),
+      timestamp: new Date().toISOString(),
+      ua: navigator.userAgent
+    };
+    // Benign errors happen when we rapidly start/stop (e.g., skipping questions).
+    // Downgrade noise for 'aborted'/'no-speech' and similar.
+    if (errorCode === 'aborted' || errorCode === 'no-speech') {
+      console.warn('STT benign event:', payload);
+    } else {
+      console.error('STT Error Details:', payload);
+    }
+    
+    if (idle) clearTimeout(idle);
+    stopping = true;
+  };
+  
   rec.start();
-  return () => {
-    listening = false;
-    if (silenceTimer) window.clearTimeout(silenceTimer);
-    if (heartbeatInterval) window.clearInterval(heartbeatInterval);
-    rec.stop();
+  
+  return () => { 
+    rec.onend = null; 
+    safeStop(); 
+    if (idle) clearTimeout(idle); 
   };
 }
+

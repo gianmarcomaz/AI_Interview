@@ -1,13 +1,10 @@
 'use client';
-import { useSession } from '@/lib/store/session';
-import { speak } from '@/lib/tts/say';
-import { Button } from '@/components/ui/button';
+import React from 'react';
 
 interface AgentPaneProps {
   currentQuestion: {
-    id: string;
     text: string;
-    category: string;
+    category?: string;
   };
   onNextQuestion: () => void;
   onPreviousQuestion: () => void;
@@ -22,13 +19,7 @@ export default function AgentPane({
   canGoNext, 
   canGoPrevious 
 }: AgentPaneProps) {
-  const { lang, ttsVoice } = useSession();
   
-  const handleSpeak = () => {
-    // Use the selected TTS voice and language from the session
-    speak(currentQuestion.text, lang, ttsVoice);
-  };
-
   // Enhanced question text with warm, conversational tone
   const getWarmQuestionText = (question: string) => {
     const warmPrefixes = [
@@ -69,38 +60,32 @@ export default function AgentPane({
         </div>
       </div>
       
-      <div className="flex gap-4 mb-4">
-        <Button 
-          onClick={handleSpeak}
-          className="flex-1 h-14 rounded-xl shadow-glow-hover"
-          cta="primary"
-          shadow
-        >
-          🔊 Speak Question
-        </Button>
-        <Button 
-          variant="secondary" 
-          onClick={onNextQuestion}
-          className="h-14 rounded-xl shadow-glow-hover"
-          cta="slate"
-          shadow
-          disabled={!canGoNext}
-        >
-          ⏭️ Next
-        </Button>
-      </div>
-
-      <div className="flex gap-4 mb-6">
-        <Button 
-          variant="secondary" 
+      <div className="flex gap-3 mt-6">
+        <button
           onClick={onPreviousQuestion}
-          className="flex-1 h-14 rounded-xl shadow-glow-hover"
-          cta="slate"
-          shadow
           disabled={!canGoPrevious}
+          className={`px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center gap-2 ${
+            canGoPrevious
+              ? 'bg-blue-600 hover:bg-blue-700 text-white shadow-lg hover:shadow-xl'
+              : 'bg-gray-600 text-gray-400 cursor-not-allowed'
+          }`}
         >
-          ⏮️ Previous
-        </Button>
+          <span>⏮️</span>
+          Previous
+        </button>
+        
+        <button
+          onClick={onNextQuestion}
+          disabled={!canGoNext}
+          className={`px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center gap-2 ${
+            canGoNext
+              ? 'bg-green-600 hover:bg-green-700 text-white shadow-lg hover:shadow-xl'
+              : 'bg-gray-600 text-gray-400 cursor-not-allowed'
+          }`}
+        >
+          Next
+          <span>⏭️</span>
+        </button>
       </div>
       
       {/* Info section removed to keep the card compact */}

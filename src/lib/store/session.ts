@@ -11,13 +11,27 @@ export const loadCampaignQuestions = (campaignId: string): Question[] => {
     if (savedSettings) {
       const parsed = JSON.parse(savedSettings);
       if (parsed.questions && Array.isArray(parsed.questions)) {
-        // Convert campaign questions to Question format
-        return parsed.questions.map((q: any, index: number) => ({
-          id: `q${q.id}`,
-          text: q.text,
-          category: q.category,
-          order: q.order
-        }));
+        // Normalize, sort, and filter questions to prevent gaps or empty items
+        const normalized: Question[] = parsed.questions
+          .map((q: any, index: number) => ({
+            id: `q${q.id ?? index + 1}`,
+            text: typeof q.text === 'string' ? q.text.trim() : '',
+            category: typeof q.category === 'string' && q.category.trim().length > 0 ? q.category : 'behavioral',
+            order: typeof q.order === 'number' ? q.order : index
+          }))
+          // Remove questions without usable text
+          .filter((q: Question) => q.text.length > 0)
+          // Sort by explicit order, then by stable index
+          .sort((a: any, b: any) => {
+            const ao = typeof a.order === 'number' ? a.order : 0;
+            const bo = typeof b.order === 'number' ? b.order : 0;
+            return ao - bo;
+          })
+          // Reassign stable ids after sorting to ensure contiguous sequence
+          .map((q: any, idx: number) => ({ ...q, id: `q${idx + 1}` }));
+
+        // Fallback if everything was filtered out
+        if (normalized.length > 0) return normalized;
       }
     }
   } catch (e) {
