@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback, useTransition } from 'react';
 import { useSearchParams, useParams } from 'next/navigation';
 import { useSession } from '@/lib/store/session';
 import { startSTT } from '@/lib/stt/webspeech';
@@ -44,6 +44,44 @@ export default function InterviewClient() {
   const [campaignQuestions, setCampaignQuestions] = useState<any[]>([]);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [firebaseSessionId, setFirebaseSessionId] = useState<string | null>(null);
+
+  // Transition to keep UI responsive on button clicks
+  const [isPending, startTransition] = useTransition();
+
+  // Memoized current question getter (placed before handlers that depend on it)
+  const getCurrentQuestion = useCallback(() => {
+    const localTotalQuestions = campaignQuestions.length > 0 ? campaignQuestions.length : 8;
+    if (campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length) {
+      const question = campaignQuestions[currentQuestionIndex];
+      const questionWithCategory = {
+        ...question,
+        category: question.category || 'behavioral'
+      };
+      console.log(`📝 Current question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, questionWithCategory);
+      return questionWithCategory;
+    }
+    const defaultQuestion = {
+      id: `default-${currentQuestionIndex + 1}`,
+      text: currentQuestionIndex === 0 
+        ? 'Give me a 30-second overview of your background and experience.'
+        : currentQuestionIndex === 1
+        ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
+        : currentQuestionIndex === 2
+        ? 'Describe a challenging project you worked on and how you overcame obstacles.'
+        : currentQuestionIndex === 3
+        ? 'Where do you see yourself professionally in the next 3-5 years?'
+        : currentQuestionIndex === 4
+        ? 'What motivates you to do your best work?'
+        : currentQuestionIndex === 5
+        ? 'Tell me about a time you had to learn something new quickly.'
+        : currentQuestionIndex === 6
+        ? 'How do you handle feedback and criticism?'
+        : 'What questions do you have for me about this role or company?',
+      category: 'behavioral'
+    } as const;
+    console.log(`📝 Using default question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, defaultQuestion);
+    return defaultQuestion;
+  }, [campaignQuestions, currentQuestionIndex]);
 
   // Initialize campaign + load saved campaign settings (lang, ttsVoice, questions)
   useEffect(() => {
@@ -431,26 +469,34 @@ export default function InterviewClient() {
   // Check if interview is completed
   const isInterviewCompleted = currentQuestionIndex >= totalQuestions - 1;
 
-  const nextQuestion = () => {
+  const nextQuestion = useCallback(() => {
     if (currentQuestionIndex < totalQuestions - 1) {
       // Save current question to Firebase before moving to next
       const currentQuestion = getCurrentQuestion();
       if (firebaseSessionId && currentQuestion.text) {
         // Ensure category exists and is a string before calling toLowerCase()
         const questionCategory = currentQuestion.category || 'behavioral';
-        saveQuestionToFirebase(currentQuestion.text, questionCategory.toLowerCase());
+        // Fire-and-forget to avoid blocking UI thread
+        setTimeout(() => {
+          void saveQuestionToFirebase(currentQuestion.text, questionCategory.toLowerCase());
+        }, 0);
       }
 
       // Move to next question
       const newIndex = currentQuestionIndex + 1;
-      setCurrentQuestionIndex(newIndex);
+      startTransition(() => {
+        setCurrentQuestionIndex(newIndex);
+      });
       
       // Add timeline event
       if (firebaseSessionId) {
-        InterviewService.addTimelineEvent(firebaseSessionId, {
-          type: 'question_advanced',
-          data: { from: currentQuestionIndex, to: newIndex }
-        });
+        // Defer IO
+        setTimeout(() => {
+          void InterviewService.addTimelineEvent(firebaseSessionId, {
+            type: 'question_advanced',
+            data: { from: currentQuestionIndex, to: newIndex }
+          });
+        }, 0);
       }
       
       console.log(`➡️ Advanced to question ${newIndex + 1}/${totalQuestions}`);
@@ -486,43 +532,51 @@ export default function InterviewClient() {
       setTimeout(() => {
         console.log(`🎤 Speaking question ${newIndex + 1}: ${nextQuestionText.substring(0, 50)}...`);
         speakQuestion(nextQuestionText);
-      }, 200); // Increased delay to prevent TTS interruptions
+      }, 160); // Slightly reduced delay for snappier feel while avoiding interruptions
       
       // If this is the last question, mark interview as completed
       if (newIndex === totalQuestions - 1) {
         console.log('🎉 Reached final question - interview will be marked as complete');
         // Add completion timeline event
         if (firebaseSessionId) {
-          InterviewService.addTimelineEvent(firebaseSessionId, {
-            type: 'final_question_reached',
-            data: { questionIndex: newIndex, totalQuestions }
-          });
+          setTimeout(() => {
+            void InterviewService.addTimelineEvent(firebaseSessionId!, {
+              type: 'final_question_reached',
+              data: { questionIndex: newIndex, totalQuestions }
+            });
+          }, 0);
         }
       }
     } else {
       console.log('🎉 Interview completed! All questions answered.');
       // Add completion timeline event
       if (firebaseSessionId) {
-        InterviewService.addTimelineEvent(firebaseSessionId, {
-          type: 'interview_completed',
-          data: { totalQuestions, completedAt: new Date().toISOString() }
-        });
+        setTimeout(() => {
+          void InterviewService.addTimelineEvent(firebaseSessionId!, {
+            type: 'interview_completed',
+            data: { totalQuestions, completedAt: new Date().toISOString() }
+          });
+        }, 0);
       }
     }
-  };
+  }, [currentQuestionIndex, totalQuestions, firebaseSessionId, getCurrentQuestion]);
 
-  const previousQuestion = () => {
+  const previousQuestion = useCallback(() => {
     if (currentQuestionIndex > 0) {
       // Move to previous question
       const newIndex = currentQuestionIndex - 1;
-      setCurrentQuestionIndex(newIndex);
+      startTransition(() => {
+        setCurrentQuestionIndex(newIndex);
+      });
       
       // Add timeline event
       if (firebaseSessionId) {
-        InterviewService.addTimelineEvent(firebaseSessionId, {
-          type: 'question_retreated',
-          data: { from: currentQuestionIndex, to: newIndex }
-        });
+        setTimeout(() => {
+          void InterviewService.addTimelineEvent(firebaseSessionId!, {
+            type: 'question_retreated',
+            data: { from: currentQuestionIndex, to: newIndex }
+          });
+        }, 0);
       }
       
       console.log(`⬅️ Returned to question ${newIndex + 1}/${totalQuestions}`);
@@ -558,61 +612,30 @@ export default function InterviewClient() {
       setTimeout(() => {
         console.log(`🎤 Speaking question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
         speakQuestion(previousQuestionText);
-      }, 200); // Increased delay to prevent TTS interruptions
+      }, 160);
     }
-  };
+  }, [currentQuestionIndex, totalQuestions, campaignQuestions, firebaseSessionId]);
 
-  const getCurrentQuestion = () => {
-    if (campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length) {
-      const question = campaignQuestions[currentQuestionIndex];
-      // Ensure question has a category, default to 'behavioral' if missing
-      const questionWithCategory = {
-        ...question,
-        category: question.category || 'behavioral'
-      };
-      console.log(`📝 Current question (${currentQuestionIndex + 1}/${totalQuestions}):`, questionWithCategory);
-      return questionWithCategory;
-    }
-    
-    // Fallback to default questions if no campaign questions loaded
-    const defaultQuestion = {
-      id: `default-${currentQuestionIndex + 1}`,
-      text: currentQuestionIndex === 0 
-        ? 'Give me a 30-second overview of your background and experience.'
-        : currentQuestionIndex === 1
-        ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
-        : currentQuestionIndex === 2
-        ? 'Describe a challenging project you worked on and how you overcame obstacles.'
-        : currentQuestionIndex === 3
-        ? 'Where do you see yourself professionally in the next 3-5 years?'
-        : currentQuestionIndex === 4
-        ? 'What motivates you to do your best work?'
-        : currentQuestionIndex === 5
-        ? 'Tell me about a time you had to learn something new quickly.'
-        : currentQuestionIndex === 6
-        ? 'How do you handle feedback and criticism?'
-        : 'What questions do you have for me about this role or company?',
-      category: 'behavioral'
-    };
-    
-    console.log(`📝 Using default question (${currentQuestionIndex + 1}/${totalQuestions}):`, defaultQuestion);
-    return defaultQuestion;
-  };
+  
 
-  const resetQuestions = () => {
-    setCurrentQuestionIndex(0);
+  const resetQuestions = useCallback(() => {
+    startTransition(() => {
+      setCurrentQuestionIndex(0);
+    });
     
     // Add timeline event
     if (firebaseSessionId) {
-      InterviewService.addTimelineEvent(firebaseSessionId, {
-        type: 'questions_reset',
-        data: { to: 0 }
-      });
+      setTimeout(() => {
+        void InterviewService.addTimelineEvent(firebaseSessionId!, {
+          type: 'questions_reset',
+          data: { to: 0 }
+        });
+      }, 0);
     }
     
     // Note: Do NOT speak the question here - ControlsBar will handle it after reset
     // This prevents duplicate speech calls
-  };
+  }, [firebaseSessionId]);
 
   // AI Voice function to speak questions
   const speakQuestion = (questionText: string) => {

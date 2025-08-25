@@ -1,5 +1,5 @@
 import { initializeApp, getApps } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
+import { getFirestore, enableIndexedDbPersistence } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -11,8 +11,17 @@ const firebaseConfig = {
 };
 
 export function getFirebase() {
-  if (!getApps().length) initializeApp(firebaseConfig);
-  return { db: getFirestore() };
+  if (!getApps().length) {
+    initializeApp(firebaseConfig);
+  }
+  const db = getFirestore();
+  // Enable offline persistence if available and safe (browser only)
+  if (typeof window !== 'undefined') {
+    try {
+      void enableIndexedDbPersistence(db).catch(() => {});
+    } catch {}
+  }
+  return { db };
 }
 
 export function signalingAvailable() {
