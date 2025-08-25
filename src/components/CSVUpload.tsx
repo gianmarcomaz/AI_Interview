@@ -1,7 +1,7 @@
 'use client';
 import Papa from 'papaparse';
 import { nanoid } from 'nanoid';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { setInvites } from '@/lib/metrics/local';
 import { Button } from '@/components/ui/button';
 
@@ -15,6 +15,11 @@ interface CSVRow {
 export default function CSVUpload({ campaignId, mode = 'structured' }: { campaignId: string; mode?: 'structured'|'conversational' }) {
   const [links, setLinks] = useState<string[]>([]);
   const [copied, setCopied] = useState(false);
+  const [origin, setOrigin] = useState('');
+  
+  useEffect(() => {
+    setOrigin(window.location.origin);
+  }, []);
   
   return (
     <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6">
@@ -36,7 +41,7 @@ export default function CSVUpload({ campaignId, mode = 'structured' }: { campaig
               Papa.parse(f, {
                 header: true,
                 complete: (res) => {
-                  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+                  if (!origin) return; // Wait for origin to be set
                   const gen = (res.data as CSVRow[]).map(row => {
                     const id = nanoid(8);
                     const name = encodeURIComponent(row.name || row.Name || '');

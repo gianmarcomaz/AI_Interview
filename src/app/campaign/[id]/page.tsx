@@ -1,17 +1,33 @@
 'use client';
 import { useParams, useSearchParams } from 'next/navigation';
 import CSVUpload from '@/components/CSVUpload';
-import { useMemo } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { getAll } from '@/lib/metrics/local';
 
 export default function CampaignDashboard() {
   const params = useParams();
   const id = String((params as any)?.id || '');
   const q = useSearchParams();
-  const origin = typeof window !== 'undefined' ? window.location.origin : '';
   const mode = ((q && q.get('m')) as 'structured'|'conversational') || 'structured';
-  const sampleSession = useMemo(() => `${origin}/i/demo123?c=${id}&m=${mode}`, [origin, id, mode]);
-  const embedSnippet = `<script src="${origin}/embed.js" data-campaign="${id}" data-mode="${mode}"></script>\n<div id="yourapp-embed"></div>`;
+  
+  // Use state to prevent hydration mismatch
+  const [sampleSession, setSampleSession] = useState('');
+  const [embedSnippet, setEmbedSnippet] = useState('');
+  const [metrics, setMetrics] = useState({ responses: 0, minutes: 0, invites: 0 });
+  
+  useEffect(() => {
+    const origin = window.location.origin;
+    setSampleSession(`${origin}/i/demo123?c=${id}&m=${mode}`);
+    setEmbedSnippet(`<script src="${origin}/embed.js" data-campaign="${id}" data-mode="${mode}"></script>\n<div id="yourapp-embed"></div>`);
+    
+    // Load metrics data
+    try {
+      const m = getAll(id);
+      setMetrics(m);
+    } catch (error) {
+      console.error('Failed to load metrics:', error);
+    }
+  }, [id, mode]);
   
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900">
@@ -26,32 +42,33 @@ export default function CampaignDashboard() {
           </p>
         </div>
 
-        {/* Quick Actions */}
-        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-6">
-          <h2 className="text-2xl font-bold text-white mb-4">🚀 Quick Actions</h2>
-          <div className="grid md:grid-cols-3 gap-4">
+        {/* Main Action Buttons */}
+        <div className="bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 p-8">
+          <h2 className="text-3xl font-bold text-white mb-8 text-center">🚀 Campaign Management</h2>
+          <div className="grid md:grid-cols-2 gap-8 max-w-4xl mx-auto">
             <a 
-              href={sampleSession} 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white p-4 rounded-xl text-center transition-all duration-200 hover:scale-105"
+              href={`/campaign/${id}/settings`}
+              className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white p-8 rounded-2xl text-center transition-all duration-300 hover:scale-105 shadow-glow group"
             >
-              <div className="text-2xl mb-2">🎤</div>
-              <div className="font-semibold">Test Interview</div>
-              <div className="text-sm opacity-90">Try it yourself first</div>
+              <div className="text-4xl mb-4 group-hover:scale-110 transition-transform duration-300">⚙️</div>
+              <div className="font-bold text-2xl mb-3">Edit Interview Settings</div>
+              <div className="text-lg opacity-90 leading-relaxed">
+                Configure STT/TTS voices, AI insights, and job descriptions for consistent interviews
+              </div>
             </a>
             
-            <button onClick={() => document.getElementById('questions')?.scrollIntoView({ behavior: 'smooth' })} className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white p-4 rounded-xl text-center transition-all duration-200 hover:scale-105">
-              <div className="text-2xl mb-2">📋</div>
-              <div className="font-semibold">View Questions</div>
-              <div className="text-sm opacity-90">See the question bank</div>
-            </button>
-            
-            <button onClick={() => document.getElementById('analytics')?.scrollIntoView({ behavior: 'smooth' })} className="bg-gradient-to-r from-orange-600 to-red-600 hover:from-orange-700 hover:to-red-700 text-white p-4 rounded-xl text-center transition-all duration-200 hover:scale-105">
-              <div className="text-2xl mb-2">📊</div>
-              <div className="font-semibold">Analytics</div>
-              <div className="text-sm opacity-90">View responses & insights</div>
-            </button>
+            <a 
+              href={sampleSession}
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white p-8 rounded-2xl text-center transition-all duration-300 hover:scale-105 shadow-glow group"
+            >
+              <div className="text-4xl mb-4 group-hover:scale-110 transition-transform duration-300">🎤</div>
+              <div className="font-bold text-2xl mb-3">Test Interview as Candidate</div>
+              <div className="text-lg opacity-90 leading-relaxed">
+                Experience the interview flow firsthand with video streaming and live transcript
+              </div>
+            </a>
           </div>
         </div>
 
@@ -66,11 +83,14 @@ export default function CampaignDashboard() {
               Send this link to candidates to start their interview
             </p>
             <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-600">
-              <p className="text-blue-300 font-mono text-sm break-all">{sampleSession}</p>
+              <p className="text-blue-300 font-mono text-sm break-all">
+                {sampleSession || 'Loading...'}
+              </p>
             </div>
             <button 
-              onClick={() => navigator.clipboard.writeText(sampleSession)}
-              className="mt-3 h-10 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-purple-600 text-white font-medium hover:from-blue-700 hover:to-purple-700 shadow-glow text-sm"
+              onClick={() => sampleSession && navigator.clipboard.writeText(sampleSession)}
+              disabled={!sampleSession}
+              className="mt-3 h-10 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-purple-600 text-white font-medium hover:from-blue-700 hover:to-purple-700 shadow-glow text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
               📋 Copy Link
             </button>
@@ -85,11 +105,14 @@ export default function CampaignDashboard() {
               Add interviews to your website or application
             </p>
             <div className="bg-slate-800/50 p-3 rounded-lg border border-slate-600">
-              <pre className="text-blue-300 text-xs overflow-x-auto">{embedSnippet}</pre>
+              <pre className="text-blue-300 text-xs overflow-x-auto">
+                {embedSnippet || 'Loading...'}
+              </pre>
             </div>
             <button 
-              onClick={() => navigator.clipboard.writeText(embedSnippet)}
-              className="mt-3 h-10 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 text-white font-medium hover:from-purple-700 hover:to-pink-700 shadow-glow text-sm"
+              onClick={() => embedSnippet && navigator.clipboard.writeText(embedSnippet)}
+              disabled={!embedSnippet}
+              className="mt-3 h-10 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 text-white font-medium hover:from-purple-700 hover:to-pink-700 shadow-glow text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
               📋 Copy Code
             </button>
@@ -117,43 +140,32 @@ export default function CampaignDashboard() {
           <div className="grid md:grid-cols-4 gap-6">
             <div className="text-center">
               <div className="bg-blue-600/20 border border-blue-500/30 rounded-xl p-4">
-                <div className="text-3xl font-bold text-blue-300 mb-2">{(() => {
-                  const m = typeof window !== "undefined" ? getAll(id) : { responses: 0 };
-                  return m.responses;
-                })()}</div>
+                <div className="text-3xl font-bold text-blue-300 mb-2">{metrics.responses}</div>
                 <div className="text-blue-200 font-semibold">Total Responses</div>
                 <div className="text-blue-300 text-sm">Interviews completed</div>
               </div>
             </div>
             <div className="text-center">
               <div className="bg-green-600/20 border border-green-500/30 rounded-xl p-4">
-                <div className="text-3xl font-bold text-green-300 mb-2">{(() => {
-                  const m = typeof window !== "undefined" ? getAll(id) : { minutes: 0 };
-                  return m.minutes;
-                })()}</div>
+                <div className="text-3xl font-bold text-green-300 mb-2">{metrics.minutes}</div>
                 <div className="text-green-200 font-semibold">Minutes</div>
                 <div className="text-green-300 text-sm">Total interview time</div>
               </div>
             </div>
             <div className="text-center">
               <div className="bg-purple-600/20 border border-purple-500/30 rounded-xl p-4">
-                <div className="text-3xl font-bold text-purple-300 mb-2">{(() => {
-                  const m = typeof window !== "undefined" ? getAll(id) : { invites: 0 };
-                  return m.invites;
-                })()}</div>
+                <div className="text-3xl font-bold text-purple-300 mb-2">{metrics.invites}</div>
                 <div className="text-purple-200 font-semibold">Invites</div>
                 <div className="text-purple-300 text-sm">CSV uploads</div>
               </div>
             </div>
             <div className="text-center">
               <div className="bg-orange-600/20 border border-orange-500/30 rounded-xl p-4">
-                <div className="text-3xl font-bold text-orange-300 mb-2">{(() => {
-                  const m = typeof window !== "undefined" ? getAll(id) : { responses: 0, invites: 0 };
-                  const connectionRate = m.invites ? Math.round((m.responses / m.invites) * 100) : 0;
-                  return connectionRate;
-                })()}%</div>
+                <div className="text-3xl font-bold text-orange-300 mb-2">
+                  {metrics.invites ? Math.round((metrics.responses / metrics.invites) * 100) : 0}%
+                </div>
                 <div className="text-orange-200 font-semibold">Questions</div>
-                <div className="text-orange-300 text-sm">In question bank</div>
+                <div className="text-blue-300 text-sm">In question bank</div>
               </div>
             </div>
           </div>

@@ -4,6 +4,51 @@ import { Question, QUESTION_BANK, pickInitial, followupOrNext, pickNextDynamic }
 
 export type Turn = { text: string; final: boolean; ts: number };
 
+// Function to load campaign questions from localStorage
+export const loadCampaignQuestions = (campaignId: string): Question[] => {
+  try {
+    const savedSettings = localStorage.getItem(`campaign-settings-${campaignId}`);
+    if (savedSettings) {
+      const parsed = JSON.parse(savedSettings);
+      if (parsed.questions && Array.isArray(parsed.questions)) {
+        // Convert campaign questions to Question format
+        return parsed.questions.map((q: any, index: number) => ({
+          id: `q${q.id}`,
+          text: q.text,
+          category: q.category,
+          order: q.order
+        }));
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load campaign questions:', e);
+  }
+  return QUESTION_BANK; // Fallback to default questions
+};
+
+// Function to pick initial question from campaign questions
+export const pickInitialFromCampaign = (campaignId?: string): Question => {
+  if (campaignId) {
+    const campaignQuestions = loadCampaignQuestions(campaignId);
+    if (campaignQuestions.length > 0) {
+      return campaignQuestions[0];
+    }
+  }
+  return pickInitial();
+};
+
+// Function to get next question from campaign questions
+export const getNextFromCampaign = (currentIndex: number, campaignId?: string): Question | null => {
+  if (campaignId) {
+    const campaignQuestions = loadCampaignQuestions(campaignId);
+    if (currentIndex < campaignQuestions.length - 1) {
+      return campaignQuestions[currentIndex + 1];
+    }
+    return null; // No more questions
+    }
+  return null;
+};
+
 type State = {
   sessionId: string;
   campaignId?: string;

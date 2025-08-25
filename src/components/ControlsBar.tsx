@@ -4,8 +4,18 @@ import { useSession } from '@/lib/store/session';
 import { speak, cancelSpeak } from '@/lib/tts/say';
 import { Button } from '@/components/ui/button';
 
-export default function ControlsBar({ onStartSTT, onStopSTT }: { onStartSTT: () => void; onStopSTT: () => void }) {
-  const { started, start, stop, currentQ, lang, ttsVoice } = useSession();
+export default function ControlsBar({ 
+  onStartSTT, 
+  onStopSTT, 
+  onResetQuestions,
+  currentQuestionText
+}: { 
+  onStartSTT: () => void; 
+  onStopSTT: () => void;
+  onResetQuestions?: () => void;
+  currentQuestionText: string;
+}) {
+  const { started, start, stop, lang, ttsVoice } = useSession();
   const [showCountdown, setShowCountdown] = useState(false);
   const [countdown, setCountdown] = useState(3);
   
@@ -21,12 +31,17 @@ export default function ControlsBar({ onStartSTT, onStopSTT }: { onStartSTT: () 
       start();
       onStartSTT();
       
+      // Reset question index if function is provided
+      if (onResetQuestions) {
+        onResetQuestions();
+      }
+      
       // Small delay to ensure everything is ready, then speak
       setTimeout(() => {
-        speak(currentQ.text, lang, ttsVoice);
+        speak(currentQuestionText, lang, ttsVoice);
       }, 500);
     }
-  }, [showCountdown, countdown, start, onStartSTT, currentQ.text, lang, ttsVoice]);
+  }, [showCountdown, countdown, start, onStartSTT, currentQuestionText, lang, ttsVoice, onResetQuestions]);
   
   const handleStartInterview = () => {
     setShowCountdown(true);
@@ -119,7 +134,7 @@ export default function ControlsBar({ onStartSTT, onStopSTT }: { onStartSTT: () 
         <Button 
           onClick={() => { 
             cancelSpeak(); 
-            speak(currentQ.text, lang, ttsVoice); 
+            speak(currentQuestionText, lang, ttsVoice); 
           }}
           variant="secondary"
           size="xl"

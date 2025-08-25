@@ -4,10 +4,14 @@ import { newPeer, getCameraStream, getScreenStream, attachStream, stopStream, re
 import { getFirebase, signalingAvailable } from "@/lib/firebase/client";
 import { callRef, setOffer, onAnswer, addIceCandidate, watchRemoteCandidates } from "@/lib/webrtc/signaling";
 import { Button } from "@/components/ui/button";
+import { InterviewService } from '@/lib/firebase/interview';
 
-type Props = { sessionId: string };
+interface VideoPublisherProps {
+  sessionId: string;
+  firebaseSessionId?: string; // Pass Firebase session ID from parent
+}
 
-export default function VideoPublisher({ sessionId }: Props) {
+export default function VideoPublisher({ sessionId, firebaseSessionId }: VideoPublisherProps) {
   const localRef = useRef<HTMLVideoElement>(null);
   const [pc, setPc] = useState<RTCPeerConnection | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -25,17 +29,42 @@ export default function VideoPublisher({ sessionId }: Props) {
 
   async function startPreview() {
     try {
+      setNote("Starting camera preview...");
       const stream = await getCameraStream(true, true);
+      
+      if (!stream || stream.getTracks().length === 0) {
+        throw new Error("No media tracks available from camera");
+      }
+      
       setLocalStream(stream);
-      if (localRef.current) attachStream(localRef.current, stream, true);
-    } catch (e:any) {
-      setNote(e?.message || "Camera/mic permission denied or not available.");
+      if (localRef.current) {
+        attachStream(localRef.current, stream, true);
+        // Ensure video element is properly configured
+        localRef.current.play().catch(e => console.warn("Video autoplay failed:", e));
+      }
+      
+      setNote("Camera preview started successfully");
+      console.log("Camera preview started with tracks:", stream.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled })));
+    } catch (e: any) {
+      console.error("Start preview failed:", e);
+      setNote(e?.message || "Camera/mic permission denied or not available. Please check browser permissions.");
     }
   }
 
   async function stopPreview() {
-    stopStream(localStream);
-    setLocalStream(null);
+    try {
+      if (localStream) {
+        stopStream(localStream);
+        setLocalStream(null);
+        if (localRef.current) {
+          localRef.current.srcObject = null;
+        }
+        setNote("Camera preview stopped");
+      }
+    } catch (e: any) {
+      console.error("Stop preview failed:", e);
+      setNote("Error stopping preview");
+    }
   }
 
   async function goLive() {
@@ -155,6 +184,23 @@ export default function VideoPublisher({ sessionId }: Props) {
         }
       }
 
+      // Save media assets to Firebase
+      if (localStream && firebaseSessionId) {
+        try {
+          await InterviewService.addMediaAsset(firebaseSessionId, {
+            uri: `webrtc://${sessionId}/publisher`,
+            kind: "video",
+            durationSec: undefined,
+            codec: "H.264",
+            checksum: undefined,
+            redacted: false
+          });
+          console.log("Media asset saved for session:", firebaseSessionId);
+        } catch (error) {
+          console.error("Failed to save media asset:", error);
+        }
+      }
+
       // Cleanup subscriptions if component unmounts during live session
       return () => { unsubAns(); unsubCand(); };
       
@@ -175,28 +221,63 @@ export default function VideoPublisher({ sessionId }: Props) {
 
   async function startScreenshare() {
     try {
+      setNote("Starting screen share...");
       const ss = await getScreenStream(true);
       const vt = ss.getVideoTracks()[0];
-      if (vt && pc) replaceVideoTrack(pc, vt);
+      
+      if (!vt) {
+        throw new Error("No video track available from screen share");
+      }
+      
+      if (vt && pc) {
+        replaceVideoTrack(pc, vt);
+        console.log("Screen share track replaced in peer connection");
+      }
 
-      // also show locally with existing audio tracks
-      const mix = new MediaStream([vt, ...(localStream?.getAudioTracks() ?? [])]);
+      // Create mixed stream with screen video and existing audio
+      const audioTracks = localStream?.getAudioTracks() || [];
+      const mix = new MediaStream([vt, ...audioTracks]);
       setLocalStream(mix);
-      if (localRef.current) attachStream(localRef.current, mix, true);
-    } catch (e:any) {
-      setNote(e?.message || "Screen share failed.");
+      
+      if (localRef.current) {
+        attachStream(localRef.current, mix, true);
+        localRef.current.play().catch(e => console.warn("Video autoplay failed:", e));
+      }
+      
+      setNote("Screen sharing started successfully");
+      console.log("Screen sharing started with track:", { kind: vt.kind, enabled: vt.enabled });
+    } catch (e: any) {
+      console.error("Screen share failed:", e);
+      setNote(e?.message || "Screen share failed. Please try again.");
     }
   }
 
   async function cameraAgain() {
     try {
+      setNote("Switching back to camera...");
       const cam = await getCameraStream(true, true);
       const vt = cam.getVideoTracks()[0];
-      if (vt && pc) replaceVideoTrack(pc, vt);
+      
+      if (!vt) {
+        throw new Error("No video track available from camera");
+      }
+      
+      if (vt && pc) {
+        replaceVideoTrack(pc, vt);
+        console.log("Camera track replaced in peer connection");
+      }
+      
       setLocalStream(cam);
-      if (localRef.current) attachStream(localRef.current, cam, true);
-    } catch (e:any) {
-      setNote(e?.message || "Could not switch back to camera.");
+      if (localRef.current) {
+        attachStream(localRef.current, cam, true);
+        localRef.current.play().catch(e => console.warn("Video autoplay failed:", e));
+      }
+      
+      setNote("Switched back to camera successfully");
+      console.log("Switched to camera with track:", { kind: vt.kind, enabled: vt.enabled });
+    } catch (e: any) {
+      console.error("Camera switch failed:", e);
+      setNote(e?.message || "Could not switch back to camera. Please try again.");
     }
   }
 
@@ -206,30 +287,69 @@ export default function VideoPublisher({ sessionId }: Props) {
   const [recStatus, setRecStatus] = useState<"idle"|"rec"|"stopping">("idle");
 
   function startRecording() {
-    if (!localStream) return;
-    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
-      ? "video/webm;codecs=vp9,opus"
-      : "video/webm";
-    const rec = new MediaRecorder(localStream, { mimeType: mime });
-    chunksRef.current = [];
-    rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: "video/webm" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = `session-${sessionId}-${Date.now()}.webm`;
-      a.click(); URL.revokeObjectURL(url);
-      setRecStatus("idle");
-    };
-    rec.start(1000);
-    recorderRef.current = rec;
-    setRecStatus("rec");
+    if (!localStream) {
+      setNote("No stream available for recording. Please start preview first.");
+      return;
+    }
+    
+    try {
+      const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+        ? "video/webm;codecs=vp9,opus"
+        : "video/webm";
+      
+      const rec = new MediaRecorder(localStream, { mimeType: mime });
+      chunksRef.current = [];
+      
+      rec.ondataavailable = (e) => { 
+        if (e.data.size) chunksRef.current.push(e.data); 
+      };
+      
+      rec.onstop = () => {
+        try {
+          const blob = new Blob(chunksRef.current, { type: "video/webm" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; 
+          a.download = `interview-session-${sessionId}-${Date.now()}.webm`;
+          a.click(); 
+          URL.revokeObjectURL(url);
+          setRecStatus("idle");
+          setNote("Recording saved successfully");
+        } catch (e) {
+          console.error("Failed to save recording:", e);
+          setNote("Failed to save recording");
+          setRecStatus("idle");
+        }
+      };
+      
+      rec.onerror = (e) => {
+        console.error("Recording error:", e);
+        setNote("Recording failed. Please try again.");
+        setRecStatus("idle");
+      };
+      
+      rec.start(1000);
+      recorderRef.current = rec;
+      setRecStatus("rec");
+      setNote("Recording started...");
+      console.log("Recording started with MIME type:", mime);
+    } catch (e: any) {
+      console.error("Failed to start recording:", e);
+      setNote(`Failed to start recording: ${e.message}`);
+    }
   }
 
   function stopRecording() {
     if (recorderRef.current && recStatus === "rec") {
-      setRecStatus("stopping");
-      recorderRef.current.stop();
+      try {
+        setRecStatus("stopping");
+        recorderRef.current.stop();
+        setNote("Stopping recording...");
+      } catch (e: any) {
+        console.error("Failed to stop recording:", e);
+        setNote("Failed to stop recording");
+        setRecStatus("idle");
+      }
     }
   }
 
