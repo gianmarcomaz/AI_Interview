@@ -5,6 +5,10 @@ import { useSearchParams, useParams } from 'next/navigation';
 import { useSession } from '@/lib/store/session';
 import { startSTT } from '@/lib/stt/webspeech';
 import { startVAD } from '@/lib/audio/vad';
+import { onSnapshot, collection, query, orderBy, doc, getDoc } from 'firebase/firestore';
+import { getFirebase } from '@/lib/firebase/client';
+
+import { useConversationalFlow } from '@/hooks/useConversationalFlow';
 
 import ControlsBar from '@/components/ControlsBar';
 import AgentPane from '@/components/AgentPane';
@@ -13,7 +17,7 @@ import DeviceCheck from '@/components/DeviceCheck';
 import { inc, addSessionMinutes } from '@/lib/metrics/local';
 import { loadCampaignQuestions } from '@/lib/store/session';
 import { InterviewService } from '@/lib/firebase/interview';
-import { CreateInterviewSessionData, AddTranscriptSegmentData, AddQuestionData } from '@/types/interview';
+import { CreateInterviewSessionData, AddTranscriptSegmentData, AddQuestionData, TranscriptSegment } from '@/types/interview';
 import { generateInsight, generateFinalSummary } from '@/lib/orchestrator/insight';
 
 // Lazy load video components for better performance
@@ -32,14 +36,25 @@ function debounce<T extends (...args: any[]) => any>(
   };
 }
 
-export default function InterviewClient() {
+export default function InterviewClient({ 
+  sessionId: propSessionId, 
+  initialMode, 
+  initialQuestionText 
+}: { 
+  sessionId: string;
+  initialMode: 'structured' | 'conversational';
+  initialQuestionText: string;
+}) {
+  // Use props for initial state to ensure SSR/CSR consistency
+  const [mode, setMode] = useState(initialMode);
+  
+  // Fallback to URL params if props aren't provided (for backward compatibility)
   const params = useParams<{ sessionId: string }>();
   const searchParams = useSearchParams();
-  const sessionId = String(params?.sessionId ?? '');
+  const sessionId = propSessionId || String(params?.sessionId ?? '');
 
   // Safely derive URL params once
   const campaignParam = searchParams?.get('c') ?? null;
-  const modeParam = searchParams?.get('m') ?? null; // FIXED: Read mode from URL
 
   // Session store (Day-2 shape uses `mode`/`setMode` for LLM mode)
   const setCampaign = useSession(s => s.setCampaign);
@@ -58,8 +73,8 @@ export default function InterviewClient() {
   const addTokens = useSession(s => s.addTokens);
   const setInsight = useSession(s => s.setInsight);
   const setFinalSummary = useSession(s => s.setFinalSummary);
-  const mode = useSession(s => s.mode);
-  const setMode = useSession(s => s.setMode); // FIXED: Add setMode selector
+  const sessionMode = useSession(s => s.mode);
+  const setSessionMode = useSession(s => s.setMode); // Keep session store mode for compatibility
   const enqueueFollowup = useSession(s => s.enqueueFollowup);
   const storeCurrentQ = useSession(s => s.currentQ);
 
@@ -75,13 +90,36 @@ export default function InterviewClient() {
     } catch {}
   }, []);
 
-  // FIXED: Set mode from URL parameter on mount
+  // Sync the hook mode with the session store mode
   useEffect(() => {
-    if (modeParam && (modeParam === 'structured' || modeParam === 'conversational')) {
-      setMode(modeParam);
-      console.log('🔄 Set interview mode from URL:', modeParam);
+    if (mode !== sessionMode) {
+      setSessionMode(mode);
+      console.log('🔄 Synced interview mode with session store:', mode);
     }
-  }, [modeParam, setMode]);
+  }, [mode, sessionMode, setSessionMode]);
+
+  // Ensure consistent initial state during SSR to prevent hydration mismatches
+  useEffect(() => {
+    // This runs only on the client after hydration
+    if (typeof window !== 'undefined') {
+      // Ensure the mode is properly set after hydration
+      if (mode && mode !== sessionMode) {
+        setSessionMode(mode);
+        console.log('🔄 Post-hydration mode sync:', mode);
+      }
+    }
+  }, []); // Only run once after mount
+
+  // Persist mode and sessionId to localStorage AFTER mount to avoid SSR/CSR mismatch
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('interview:mode', mode);
+      localStorage.setItem('interview:activeSessionId', sessionId);
+      console.log('💾 Persisted mode and sessionId to localStorage:', { mode, sessionId });
+    }
+  }, [mode, sessionId]);
+
+
 
   // Helper function to check TTS availability and permissions
   const checkTTSAvailability = useCallback(() => {
@@ -274,6 +312,24 @@ export default function InterviewClient() {
     });
   };
 
+  // Initialize conversational flow hook
+  const { onAnswerFinalized, nextDisabled, isGenerating } = useConversationalFlow({
+    mode,
+    setCurrentQuestion: (q: { id: string; text: string }) => {
+      useSession.getState().setInitialQuestion({
+        id: q.id,
+        text: q.text,
+        topic: 'behavioral',
+        difficulty: 2
+      });
+    },
+    incrementQuestionIndex: () => {
+      const session = useSession.getState();
+      session.advance();
+    },
+    speakQuestion,
+  });
+
   // FIXED: Conversational mode seeding - ensure AI follow-ups are generated
   useEffect(() => {
     if (mode !== 'conversational') return;
@@ -283,10 +339,10 @@ export default function InterviewClient() {
     // Clear any existing follow-ups when switching to conversational mode
     useSession.getState().clearFollowups();
     
-    // Seed initial question for conversational mode
-    const seed = 'Give me a 30-second overview of your background and experience.';
+    // Seed initial question for conversational mode using props to ensure SSR/CSR consistency
+    const seed = initialQuestionText;
     
-    // FIXED: Set the initial question in the session store to start progress at 1
+    // FIXED: Set the initial question in the session store to start progress at 0
     const session = useSession.getState();
     if (session.qIndex === 0) {
       session.setInitialQuestion({
@@ -300,20 +356,9 @@ export default function InterviewClient() {
       enqueueFollowup(seed as any);
       console.log('🌱 Seeded initial conversational question:', seed);
     }
-  }, [mode, enqueueFollowup]);
+  }, [mode, enqueueFollowup, initialQuestionText]);
 
-  // FIXED: Remove the duplicate mode reset effect that was causing issues
-  // useEffect(() => {
-  //   if (mode === 'conversational') {
-  //     // Clear any existing questions and start fresh
-  //     useSession.getState().clearFollowups();
-  //     // Seed with initial question
-  //     const seed = Math.random() < 0.5
-  //       ? 'Give me a 30-second overview of your background and experience.'
-  //       : 'What recent project are you most proud of, and why?';
-  //     enqueueFollowup(seed as any);
-  //   }
-  // }, [mode, enqueueFollowup]);
+
 
   // Speak the seed once it exists before STT is listening
   useEffect(() => {
@@ -323,18 +368,16 @@ export default function InterviewClient() {
     }
   }, [mode, storeCurrentQ?.text, started, speakQuestion]);
 
-  // Reset conversational mode when switching modes
-  useEffect(() => {
-    if (mode === 'conversational') {
-      // Clear any existing questions and start fresh
-      useSession.getState().clearFollowups();
-      // Seed with initial question
-      const seed = Math.random() < 0.5
-        ? 'Give me a 30-second overview of your background and experience.'
-        : 'What recent project are you most proud of, and why?';
-      enqueueFollowup(seed as any);
-    }
-  }, [mode, enqueueFollowup]);
+       // Reset conversational mode when switching modes
+     useEffect(() => {
+       if (mode === 'conversational') {
+         // Clear any existing questions and start fresh
+         useSession.getState().clearFollowups();
+         // Seed with initial question using props to ensure SSR/CSR consistency
+         const seed = initialQuestionText;
+         enqueueFollowup(seed as any);
+       }
+     }, [mode, enqueueFollowup, initialQuestionText]);
 
   const [partial, setPartialLocal] = useState('');
   const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
@@ -350,6 +393,10 @@ export default function InterviewClient() {
   const [sttError, setSttError] = useState<string | null>(null);
   const [videoEnabled, setVideoEnabled] = useState(false); // Control video component loading
   const [isLoading, setIsLoading] = useState(false); // Loading state for operations
+  
+  // Firebase transcript state for real-time updates
+  const [firebaseTranscripts, setFirebaseTranscripts] = useState<TranscriptSegment[]>([]);
+  const [transcriptListener, setTranscriptListener] = useState<(() => void) | null>(null);
   
   // Transition to keep UI responsive on button clicks
   const [, startTransition] = useTransition();
@@ -374,9 +421,9 @@ export default function InterviewClient() {
     
     const snippet = answer.slice(-400);
     const facts: { id: string; text: string }[] = []; // TODO: integrate with search index if available
-    const sess = String((params as any)?.sessionId || "");
-    const turnId = `sess#${sess}:t${Date.now()}`;
-    const tokenBudgetLeft = Math.max(0, (softCap || 0) - (tokensUsed || 0));
+         const sess = String((params as any)?.sessionId || "");
+     const turnId = `sess#${sess}:t${sess.length}`;
+     const tokenBudgetLeft = Math.max(0, (softCap || 0) - (tokensUsed || 0));
 
     try {
       const { json, latency, usedTokens } = await generateInsight({
@@ -405,17 +452,17 @@ export default function InterviewClient() {
         const currentQueue = useSession.getState().followupQueue;
         console.log('📋 Current follow-up queue length:', currentQueue.length);
         
-        // FIXED: Immediately update the current question to show the AI-generated follow-up
-        const session = useSession.getState();
-        if (session.currentQ.text !== json.followup) {
-          session.setInitialQuestion({
-            id: `ai-followup-${Date.now()}`,
-            text: json.followup,
-            topic: 'behavioral',
-            difficulty: 2
-          });
-          console.log('🔄 Updated current question to AI follow-up:', json.followup);
-        }
+                 // FIXED: Immediately update the current question to show the AI-generated follow-up
+         const session = useSession.getState();
+         if (session.currentQ.text !== json.followup) {
+           session.setInitialQuestion({
+             id: `ai-followup-${json.followup.length}`,
+             text: json.followup,
+             topic: 'behavioral',
+             difficulty: 2
+           });
+           console.log('🔄 Updated current question to AI follow-up:', json.followup);
+         }
       }
     } catch (error) {
       if (isDebug) console.error('Failed to generate insight:', error);
@@ -425,7 +472,13 @@ export default function InterviewClient() {
   // Final session summary generation
   const generateFinalSummaryAndNavigate = async () => {
     try {
-      const sess = String((params as any)?.sessionId || "");
+      // Use the real Firebase session ID if available, fallback to route param
+      const sess = firebaseSessionId || String((params as any)?.sessionId || "");
+      if (!sess) {
+        console.error("No session ID available for report generation");
+        return;
+      }
+      
       if (!transcript?.length) {
         console.warn("No local transcript, fetching from server...");
         // Navigate to reports page where transcripts will be loaded from Firebase
@@ -450,15 +503,17 @@ export default function InterviewClient() {
       addTokens(usedTokens);
       setFinalSummary(json);
 
-      // Navigate to reports page
+      // Navigate to reports page with real session ID
       const reportUrl = `/reports/${sess}${campaignParam ? `?c=${campaignParam}` : ''}`;
       window.location.href = reportUrl;
     } catch (error) {
       console.error('Failed to generate final summary:', error);
       // Fallback: navigate without summary
-      const sess = String((params as any)?.sessionId || "");
-      const reportUrl = `/reports/${sess}${campaignParam ? `?c=${campaignParam}` : ''}`;
-      window.location.href = reportUrl;
+      const sess = firebaseSessionId || String((params as any)?.sessionId || "");
+      if (sess) {
+        const reportUrl = `/reports/${sess}${campaignParam ? `?c=${campaignParam}` : ''}`;
+        window.location.href = reportUrl;
+      }
     }
   };
 
@@ -513,8 +568,22 @@ export default function InterviewClient() {
       gain.gain.value = vol;
       osc.connect(gain).connect(ctx.destination);
       osc.start();
-      setTimeout(() => { try { osc.stop(); ctx.close(); } catch {} }, ms);
-    } catch {}
+      setTimeout(() => { 
+        try { 
+          osc.stop(); 
+          // Only close if the context is not already closed and not suspended
+          if (ctx.state !== 'closed' && ctx.state !== 'suspended') {
+            ctx.close(); 
+          }
+        } catch (e) {
+          // Ignore any errors during cleanup
+          console.debug('Beep cleanup error (normal):', e);
+        } 
+      }, ms);
+    } catch (e) {
+      // Ignore any errors during beep creation
+      console.debug('Beep creation error (normal):', e);
+    }
   }
 
   function waitForSilence(ms = 600) {
@@ -576,10 +645,10 @@ export default function InterviewClient() {
         return sessionQ;
       }
       // FIXED: For conversational mode, never fall back to structured questions
-      // Return a default seed question instead
+      // Return the initial question text from props to ensure SSR/CSR consistency
       return {
         id: 'conversational-default',
-        text: 'Give me a 30-second overview of your background and experience.',
+        text: initialQuestionText,
         category: 'behavioral'
       };
     }
@@ -598,7 +667,7 @@ export default function InterviewClient() {
     
     // Default questions for structured mode
     const defaultQuestions = [
-      'Give me a 30-second overview of your background and experience.',
+      initialQuestionText,
       'How would you keep p95 <1s in a live STT to summary pipeline?',
       'Describe a challenging project you worked on and how you overcame obstacles.',
       'Where do you see yourself professionally in the next 3-5 years?',
@@ -616,7 +685,7 @@ export default function InterviewClient() {
     
     console.log(`📝 Structured mode - Default question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, defaultQuestion);
     return defaultQuestion;
-  }, [campaignQuestions, currentQuestionIndex, mode]);
+  }, [campaignQuestions, currentQuestionIndex, mode, initialQuestionText]);
 
   // Initialize campaign + load saved campaign settings (lang, ttsVoice, questions)
   useEffect(() => {
@@ -679,8 +748,105 @@ export default function InterviewClient() {
       if (vadStopRef.current) {
         vadStopRef.current();
       }
+      // Cleanup transcript listener
+      if (transcriptListener) {
+        transcriptListener();
+        setTranscriptListener(null);
+      }
     };
-  }, []);
+  }, [transcriptListener]);
+
+  // Real-time transcript fetching from Firebase
+  useEffect(() => {
+    if (!firebaseSessionId) return;
+
+    console.log('🎧 Setting up real-time transcript listener for session:', firebaseSessionId);
+    
+    try {
+      const { db } = getFirebase();
+      
+      // Create real-time listener for the session document to watch transcripts array
+      const sessionDoc = doc(db, 'sessions', firebaseSessionId);
+      
+      const unsubscribe = onSnapshot(sessionDoc, (docSnapshot: any) => {
+        if (docSnapshot.exists()) {
+          const sessionData = docSnapshot.data();
+          const transcripts = sessionData.transcripts || [];
+          
+          console.log('📝 Real-time transcript update:', transcripts.length, 'segments');
+          setFirebaseTranscripts(transcripts);
+          
+          // Also update the session store transcript for consistency
+          const session = useSession.getState();
+          if (transcripts.length > 0) {
+            // Convert Firebase transcript format to session store format
+            const sessionTranscripts = transcripts.map((t: TranscriptSegment) => ({
+              role: 'user' as const, // Firebase transcripts are user responses
+              text: t.textClean || t.textRaw || '',
+              ts: t.tEnd || Date.now()
+            }));
+            
+            // Update session store transcript
+            session.setTranscript(sessionTranscripts);
+          }
+        }
+      }, (error: any) => {
+        console.error('❌ Error in transcript listener:', error);
+      });
+      
+      // Store the unsubscribe function
+      setTranscriptListener(() => unsubscribe);
+      
+      // Cleanup function
+      return () => {
+        console.log('🔇 Cleaning up transcript listener');
+        unsubscribe();
+        setTranscriptListener(null);
+      };
+    } catch (error) {
+      console.error('❌ Failed to setup transcript listener:', error);
+    }
+  }, [firebaseSessionId]);
+
+  // Load existing transcripts when session is available
+  useEffect(() => {
+    if (!firebaseSessionId) return;
+
+    const loadExistingTranscripts = async () => {
+      try {
+        console.log('📚 Loading existing transcripts for session:', firebaseSessionId);
+        
+        // Get the session document to load existing transcripts
+        const { db } = getFirebase();
+        const sessionDoc = doc(db, 'sessions', firebaseSessionId);
+        const docSnapshot = await getDoc(sessionDoc);
+        
+        if (docSnapshot.exists()) {
+          const sessionData = docSnapshot.data();
+          const transcripts = sessionData.transcripts || [];
+          
+          console.log('📝 Loaded existing transcripts:', transcripts.length, 'segments');
+          setFirebaseTranscripts(transcripts);
+          
+          // Update session store transcript
+          const session = useSession.getState();
+          if (transcripts.length > 0) {
+            const sessionTranscripts = transcripts.map((t: TranscriptSegment) => ({
+              role: 'user' as const,
+              text: t.textClean || t.textRaw || '',
+              ts: t.tEnd || Date.now()
+            }));
+            
+            session.setTranscript(sessionTranscripts);
+          }
+        }
+      } catch (error) {
+        console.error('❌ Failed to load existing transcripts:', error);
+      }
+    };
+
+    loadExistingTranscripts();
+  }, [firebaseSessionId]);
 
   // Ensure TTS voices are loaded for consistent voice selection
   useEffect(() => {
@@ -705,9 +871,8 @@ export default function InterviewClient() {
     if (mode === 'conversational') {
       // For conversational mode, count based on session store's qIndex
       const sessionQIndex = useSession.getState().qIndex;
-      // FIXED: Ensure we always show at least 1 when there's a current question
-      const baseCount = Math.max(1, sessionQIndex);
-      return Math.min(baseCount, 8); // Cap at 8 for conversational mode
+      // Start from 0, not 1
+      return Math.min(sessionQIndex, 8); // Cap at 8 for conversational mode
     } else {
       // For structured mode, use current question index
       return currentQuestionIndex >= memoizedTotalQuestions - 1 ? memoizedTotalQuestions : currentQuestionIndex + 1;
@@ -735,24 +900,40 @@ export default function InterviewClient() {
         return sessionQ;
       }
       // FIXED: For conversational mode, never fall back to structured questions
-      // Return a default seed question instead
+      // Return the initial question text from props to ensure SSR/CSR consistency
       return {
         id: 'conversational-default',
-        text: 'Give me a 30-second overview of your background and experience.',
+        text: initialQuestionText,
         category: 'behavioral'
       };
     } else {
       // For structured mode, use the existing logic
-      return getCurrentQuestion();
+      const question = getCurrentQuestion();
+      // Ensure the question has required properties
+      if (question && question.text) {
+        return {
+          ...question,
+          category: question.category || 'behavioral'
+        };
+      }
+      // Fallback to initial question if getCurrentQuestion returns undefined
+      return {
+        id: 'fallback-default',
+        text: initialQuestionText,
+        category: 'behavioral'
+      };
     }
-  }, [mode, getCurrentQuestion]);
+  }, [mode, getCurrentQuestion, initialQuestionText]);
 
   // Memoized mode-dependent values
   const isConversationalMode = useMemo(() => mode === 'conversational', [mode]);
-  const canGoNext = useMemo(() => 
-    isConversationalMode ? true : currentQuestionIndex < memoizedTotalQuestions - 1, 
-    [isConversationalMode, currentQuestionIndex, memoizedTotalQuestions]
-  );
+  const canGoNext = useMemo(() => {
+    if (isConversationalMode) {
+      // In conversational mode, only allow next when not generating
+      return !isGenerating;
+    }
+    return currentQuestionIndex < memoizedTotalQuestions - 1;
+  }, [isConversationalMode, currentQuestionIndex, memoizedTotalQuestions, isGenerating]);
   const canGoPrevious = useMemo(() => 
     isConversationalMode ? false : currentQuestionIndex > 0, 
     [isConversationalMode, currentQuestionIndex]
@@ -784,7 +965,7 @@ export default function InterviewClient() {
       }
       
       // Generate unique candidate ID for each session
-      const uniqueCandidateId = `candidate_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const uniqueCandidateId = `candidate_${Math.floor(Math.random() * 1000000)}_${Math.random().toString(36).substr(2, 9)}`;
       
       const sessionData: CreateInterviewSessionData = {
         candidateId: uniqueCandidateId,
@@ -813,12 +994,19 @@ export default function InterviewClient() {
       console.log('📋 Session data prepared:', sessionData);
       const newSessionId = await InterviewService.createSession(sessionData);
       setFirebaseSessionId(newSessionId);
+      
+      // Store the session ID in localStorage for reports page access
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('interview:activeSessionId', newSessionId);
+        console.log('💾 Stored session ID in localStorage:', newSessionId);
+      }
+      
       console.log('✅ Firebase session created successfully:', newSessionId);
       
       // Add initial timeline event
       await InterviewService.addTimelineEvent(newSessionId, {
         type: 'interview_started',
-        data: { campaignId: campaignParam, candidateId: uniqueCandidateId }
+        data: { campaignId: campaignParam, candidateId: uniqueCandidateId, interviewMode: mode }
       });
       
       return newSessionId;
@@ -992,9 +1180,14 @@ export default function InterviewClient() {
           // Generate AI insight after final answer
           setTimeout(() => runInsight(t), 2000); // Debounced by 2s
           
-          // Auto-advance after final transcript (only if not at last question)
-          if (currentQuestionIndex < memoizedTotalQuestions - 1) {
-            maybeAutoAdvance();
+          // Handle conversational flow for follow-up questions
+          if (mode === 'conversational') {
+            onAnswerFinalized(t);
+          } else {
+            // Auto-advance after final transcript (only if not at last question)
+            if (currentQuestionIndex < memoizedTotalQuestions - 1) {
+              maybeAutoAdvance();
+            }
           }
           
           // Clear timers since we got a final result
@@ -1404,14 +1597,14 @@ export default function InterviewClient() {
   useEffect(() => {
     if (mode === 'conversational' && storeCurrentQ?.text) {
       const session = useSession.getState();
-      // If we have a question but qIndex is 0, set it to 1 to show progress
+      // If we have a question but qIndex is 0, keep it at 0 to start from 0
       if (session.qIndex === 0 && storeCurrentQ.text !== 'Give me a 30-second overview of your background and experience.') {
-        console.log('🔄 Initializing conversational progress to 1');
+        console.log('🔄 Initializing conversational progress to 0');
         session.setInitialQuestion({
           ...storeCurrentQ,
           id: storeCurrentQ.id || 'conversational-init'
         });
-        // Don't increment qIndex here - let the first answer do that
+        // Keep qIndex at 0 to start from 0
       }
     }
   }, [mode, storeCurrentQ?.text]);
@@ -1469,6 +1662,13 @@ export default function InterviewClient() {
                       style={{ width: `${(completedQuestions / totalQuestions) * 100}%` }}
                     ></div>
                   </div>
+                  {/* Show agent thinking indicator in conversational mode */}
+                  {mode === 'conversational' && isGenerating && (
+                    <div className="mt-3 flex items-center justify-center gap-2 text-blue-300 text-sm">
+                      <div className="w-4 h-4 border-2 border-blue-300 border-t-transparent rounded-full animate-spin"></div>
+                      <span>Agent is thinking...</span>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1567,11 +1767,29 @@ export default function InterviewClient() {
           <div className="lg:col-span-5">
             <div className="animate-fade-in-up" style={{ animationDelay: '0.05s' }}>
               <AgentPane 
-                currentQuestion={mode === 'conversational' ? 
-                  { 
-                    text: storeCurrentQ?.text || 'Give me a 30-second overview of your background and experience.', 
-                    category: (storeCurrentQ as any)?.category || 'behavioral' 
-                  } : currentQuestion}
+                key={`${mode}-${storeCurrentQ?.text || currentQuestion?.text || 'default'}`}
+                currentQuestion={(() => {
+                  // Ensure consistent question text during SSR to prevent hydration mismatches
+                  if (mode === 'conversational') {
+                    const questionText = storeCurrentQ?.text || initialQuestionText;
+                    return {
+                      text: questionText,
+                      category: (storeCurrentQ as any)?.category || 'behavioral'
+                    };
+                  }
+                  // Ensure currentQuestion has required properties with fallbacks
+                  if (currentQuestion && currentQuestion.text) {
+                    return {
+                      text: currentQuestion.text,
+                      category: currentQuestion.category || 'behavioral'
+                    };
+                  }
+                  // Fallback to initial question if currentQuestion is undefined
+                  return {
+                    text: initialQuestionText,
+                    category: 'behavioral'
+                  };
+                })()}
                 onNextQuestion={nextQuestion}
                 onPreviousQuestion={previousQuestion}
                 canGoNext={canGoNext}
@@ -1752,7 +1970,8 @@ export default function InterviewClient() {
                 <div className="flex gap-4 justify-center">
                   <button
                     onClick={generateFinalSummaryAndNavigate}
-                    className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold px-8 py-4 rounded-2xl transition-all duration-300 hover:scale-105 shadow-lg"
+                    className="bg-gradient-to-r from-blue-600 to-purple-700 hover:from-blue-700 hover:to-purple-700 text-white font-semibold px-8 py-4 rounded-2xl transition-all duration-300 hover:scale-105 shadow-lg"
+                    disabled={!firebaseSessionId}
                   >
                     📊 Generate Final Report
                   </button>

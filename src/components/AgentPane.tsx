@@ -22,17 +22,10 @@ export default function AgentPane({
   
   // Enhanced question text with warm, conversational tone
   const getWarmQuestionText = (question: string) => {
-    const warmPrefixes = [
-      "Thanks for that. ",
-      "Great answer. ",
-      "I appreciate that insight. ",
-      "That's helpful. ",
-      "Interesting perspective. "
-    ];
-    
-    // For follow-up questions, add warm prefix
+    // Use a deterministic approach to avoid hydration mismatches
+    // For follow-up questions, add a consistent warm prefix
     if (question.includes('Could you') || question.includes('How did you') || question.includes('What drove')) {
-      return warmPrefixes[Math.floor(Math.random() * warmPrefixes.length)] + question;
+      return "Thanks for that. " + question;
     }
     
     return question;
@@ -50,9 +43,11 @@ export default function AgentPane({
       <div className="bg-slate-800/30 p-5 rounded-2xl border border-slate-600 mb-6">
         <div className="space-y-4">
           <div className="flex items-center gap-3 mb-4">
-            <span className="text-blue-300 text-sm font-semibold uppercase tracking-wide bg-blue-900/30 px-3 py-2 rounded-lg border border-blue-700/30">
-              {currentQuestion.category}
-            </span>
+            {currentQuestion.category && (
+              <span className="text-blue-300 text-sm font-semibold uppercase tracking-wide bg-blue-900/30 px-3 py-2 rounded-lg border border-blue-700/30">
+                {currentQuestion.category}
+              </span>
+            )}
           </div>
           <div className="text-xl text-white leading-relaxed font-medium">
             {getWarmQuestionText(currentQuestion.text)}
@@ -102,7 +97,9 @@ export function speakBackchannel() {
     'Okay.',
     "I see.",
   ];
-  const utter = new SpeechSynthesisUtterance(phrases[Math.floor(Math.random()*phrases.length)]);
+  // Use a deterministic approach to avoid hydration mismatches
+  const phraseIndex = Math.floor((Date.now() % 1000) / 250); // Cycles through phrases every 250ms
+  const utter = new SpeechSynthesisUtterance(phrases[phraseIndex % phrases.length]);
   utter.rate = 0.95;
   utter.pitch = 1.0;
   utter.volume = 1.0;

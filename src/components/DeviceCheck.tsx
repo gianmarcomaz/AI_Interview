@@ -14,6 +14,7 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   // Helper function to configure TTS with consistent voice settings
   const configureTTSVoice = (utterance: SpeechSynthesisUtterance) => {
@@ -61,6 +62,9 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
           rafRef.current = requestAnimationFrame(loop);
         };
         loop();
+        
+        // Store the audioContext for cleanup
+        audioContextRef.current = audioContext;
       } catch {
         setOk(false);
       }
@@ -68,6 +72,15 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       streamRef.current?.getTracks().forEach(t=>t.stop());
+      // Clean up AudioContext if it exists and is not closed
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed' && audioContextRef.current.state !== 'suspended') {
+        try {
+          audioContextRef.current.close();
+        } catch (e) {
+          // Ignore any errors during cleanup
+          console.debug('DeviceCheck AudioContext cleanup error (normal):', e);
+        }
+      }
     };
   }, []);
 

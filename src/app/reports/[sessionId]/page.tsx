@@ -16,9 +16,22 @@ export default function ReportsPage() {
   const params = useParams<{ sessionId: string }>();
   const searchParams = useSearchParams();
 
-  const sessionId = String(params?.sessionId || "");
+  const routeSessionId = String(params?.sessionId || "");
   const c = searchParams?.get("c") || undefined;
   const campaignId = typeof c === "string" ? c : undefined;
+  
+  // Prefer the real session ID from localStorage, with safe fallback
+  const [sessionId, setSessionId] = useState<string>(routeSessionId);
+  
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const localId = localStorage.getItem("interview:activeSessionId");
+      if (localId && localId !== routeSessionId) {
+        setSessionId(localId);
+        console.log('🔄 Using real session ID from localStorage:', localId);
+      }
+    }
+  }, [routeSessionId]);
 
   const { db } = getFirebase();
 

@@ -4,12 +4,21 @@ import { useParams, useSearchParams } from 'next/navigation';
 import CSVUpload from '@/components/CSVUpload';
 import { useMemo, useState, useEffect } from 'react';
 import { getAll } from '@/lib/metrics/local';
+import { useInterviewMode } from '@/hooks/useInterviewMode';
 
 export default function CampaignDashboard() {
   const params = useParams();
   const id = String((params as any)?.id || '');
   const q = useSearchParams();
-  const mode = ((q && q.get('m')) as 'structured'|'conversational') || 'structured';
+  const { mode, setMode } = useInterviewMode();
+  
+  // Update mode when URL changes
+  useEffect(() => {
+    const urlMode = q?.get('m') as 'structured' | 'conversational';
+    if (urlMode && (urlMode === 'structured' || urlMode === 'conversational')) {
+      setMode(urlMode);
+    }
+  }, [q, setMode]);
   
   // Use state to prevent hydration mismatch
   const [sampleSession, setSampleSession] = useState('');
