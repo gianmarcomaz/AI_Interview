@@ -10,11 +10,11 @@ import AgentPane from '@/components/AgentPane';
 import TranscriptPane from '@/components/TranscriptPane';
 import DeviceCheck from '@/components/DeviceCheck';
 import VideoPublisher from '@/components/VideoPublisher';
-import LanguagePicker from '@/components/LanguagePicker';
 import { inc, addSessionMinutes } from '@/lib/metrics/local';
 import { loadCampaignQuestions } from '@/lib/store/session';
 import { InterviewService } from '@/lib/firebase/interview';
-import { CreateInterviewSessionData, AddTranscriptSegmentData, AddQuestionData, AddAnswerData } from '@/types/interview';
+import { CreateInterviewSessionData, AddTranscriptSegmentData, AddQuestionData } from '@/types/interview';
+import { generateInsight, generateFinalSummary } from '@/lib/orchestrator/insight';
 
 export default function InterviewClient() {
   const params = useParams<{ sessionId: string }>();
@@ -25,16 +25,37 @@ export default function InterviewClient() {
   const campaignParam = searchParams?.get('c') ?? null;
 
   // Session store (Day-2 shape uses `mode`/`setMode` for LLM mode)
-  const {
-    setCampaign,
-    lang,         // STT language
-    setLang,
-    setTtsVoice,
-    setPartial,
-    pushFinal,
-    transcript,   // needed for TranscriptPane
-    started,
-  } = useSession();
+  const setCampaign = useSession(s => s.setCampaign);
+  const lang = useSession(s => s.lang);
+  const setLang = useSession(s => s.setLang);
+  const setTtsVoice = useSession(s => s.setTtsVoice);
+  const setPartial = useSession(s => s.setPartial);
+  const pushFinal = useSession(s => s.pushFinal);
+  const transcript = useSession(s => s.transcript);
+  const started = useSession(s => s.started);
+  const llmMode = useSession(s => s.llmMode);
+  const rollingSummary = useSession(s => s.rollingSummary);
+  const insights = useSession(s => s.insights);
+  const tokensUsed = useSession(s => s.tokensUsed);
+  const softCap = useSession(s => s.softCap);
+  const addTokens = useSession(s => s.addTokens);
+  const setInsight = useSession(s => s.setInsight);
+  const setFinalSummary = useSession(s => s.setFinalSummary);
+  const mode = useSession(s => s.mode);
+  const enqueueFollowup = useSession(s => s.enqueueFollowup);
+  const storeCurrentQ = useSession(s => s.currentQ);
+
+  // On mount, if cloud LLM is actually available and budget allows, flip mode to 'cloud'
+  // This runs only on client to avoid SSR/CSR mismatch
+  useEffect(() => {
+    try {
+      const canCloud = Boolean(process.env.NEXT_PUBLIC_LLM_SOFT_TOKEN_CAP) && (typeof window !== 'undefined');
+      if (canCloud) {
+        // Try a lightweight check: presence of env is enough; server route will guard missing keys
+        useSession.getState().setLLMMode('cloud');
+      }
+    } catch {}
+  }, []);
 
   const [partial, setPartialLocal] = useState('');
   const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
@@ -50,13 +71,8 @@ export default function InterviewClient() {
   const [sttError, setSttError] = useState<string | null>(null);
 
   // Transition to keep UI responsive on button clicks
-  const [isPending, startTransition] = useTransition();
-
-  // Follow-up question queue for smart, adaptive interviewing
-  const [followUpQueue, setFollowUpQueue] = useState<string[]>([]);
-
-  // Micro-acknowledgement phrases for human-like interaction
-  const ACKS = ['Got it.', 'Thanks.', 'Okay.', 'Understood.', 'I see.', 'Right.'];
+  const [, startTransition] = useTransition();
+  const [clickBusy, setClickBusy] = useState(false);
   
   // Timing constants for natural interview flow
   const SOFT_MS = 40_000;  // 40s soft cap - natural pause point
@@ -68,15 +84,73 @@ export default function InterviewClient() {
   const lastSpeechAtRef = useRef<number>(0);
   const vadStopRef = useRef<(() => void) | null>(null);
   
-  // Smart follow-up questions (zero-cost heuristics)
-  const rulesFollowup = (answer: string): string | null => {
-    const s = answer.toLowerCase();
-    if (/\d/.test(s)) return 'What drove that number?';
-    if (/cache|latency|throughput|scale|performance/.test(s)) return 'How did you measure the impact?';
-    if (s.split(/\s+/).length < 10) return 'Could you share a concrete example?';
-    if (/problem|challenge|issue/.test(s)) return 'What was the root cause? How did you identify it?';
-    if (/result|outcome|impact/.test(s)) return 'How did you measure success? What were the key metrics?';
-    return null;
+  // AI insight generation
+  const runInsight = async (answer: string) => {
+    if (!answer.trim()) return;
+    
+    const snippet = answer.slice(-400);
+    const facts: { id: string; text: string }[] = []; // TODO: integrate with search index if available
+    const sess = String((params as any)?.sessionId || "");
+    const turnId = `sess#${sess}:t${Date.now()}`;
+    const tokenBudgetLeft = Math.max(0, (softCap || 0) - (tokensUsed || 0));
+
+    try {
+      const { json, latency, usedTokens } = await generateInsight({
+        mode: llmMode,
+        turnId,
+        rollingSummary: rollingSummary || "",
+        snippet,
+        facts,
+        tokenBudgetLeft
+      });
+
+      addTokens(usedTokens);
+      setInsight(json, latency);
+      
+      // Enqueue AI follow-up if in conversational mode and insight provides one
+      if (mode === 'conversational' && json.followup) {
+        enqueueFollowup(json.followup);
+      }
+    } catch (error) {
+      console.error('Failed to generate insight:', error);
+    }
+  };
+
+  // Final session summary generation
+  const generateFinalSummaryAndNavigate = async () => {
+    try {
+      const sess = String((params as any)?.sessionId || "");
+      if (!transcript?.length) {
+        alert('No transcript to summarize');
+        return;
+      }
+      const transcriptData = transcript.map(t => ({ 
+        role: (t.final ? "user" : "ai") as "user" | "ai", 
+        text: t.text 
+      }));
+      const tokenBudgetLeft = Math.max(0, (softCap || 0) - (tokensUsed || 0));
+
+      const { json, usedTokens } = await generateFinalSummary({
+        mode: llmMode,
+        sessionId: sess,
+        transcript: transcriptData,
+        insights: insights || [],
+        tokenBudgetLeft
+      });
+
+      addTokens(usedTokens);
+      setFinalSummary(json);
+
+      // Navigate to reports page
+      const reportUrl = `/reports/${sess}${campaignParam ? `?c=${campaignParam}` : ''}`;
+      window.location.href = reportUrl;
+    } catch (error) {
+      console.error('Failed to generate final summary:', error);
+      // Fallback: navigate without summary
+      const sess = String((params as any)?.sessionId || "");
+      const reportUrl = `/reports/${sess}${campaignParam ? `?c=${campaignParam}` : ''}`;
+      window.location.href = reportUrl;
+    }
   };
 
   // Helper function to configure TTS with consistent voice settings
@@ -98,22 +172,6 @@ export default function InterviewClient() {
   };
 
   // --- Manual+ Half-duplex primitives ---
-  const turnRef = useRef<'idle'|'tts'|'stt'>('idle');
-
-  function speakAsync(text: string, opts: { rate?: number; pitch?: number } = {}) {
-    return new Promise<void>((resolve) => {
-      const u = new SpeechSynthesisUtterance(text);
-      // Configure voice for consistency
-      try { configureTTSVoice(u); } catch {}
-      u.rate = opts.rate ?? 1.0;
-      u.pitch = opts.pitch ?? 1.0;
-      u.onstart = () => { turnRef.current = 'tts'; stopMic(); };
-      u.onend = () => { setTimeout(() => { turnRef.current = 'idle'; resolve(); }, 300); };
-      u.onerror = () => { turnRef.current = 'idle'; resolve(); };
-      try { window.speechSynthesis.cancel(); } catch {}
-      try { window.speechSynthesis.speak(u); } catch { resolve(); }
-    });
-  }
 
   async function beep(ms = 120, freq = 880, vol = 0.03) {
     try {
@@ -150,41 +208,29 @@ export default function InterviewClient() {
   };
 
   const maybeAutoAdvance = () => {
+    if (mode !== 'structured') return;  // conversational pace driven by AI followups
     const now = performance.now();
     const spokeLongEnough = (now - turnStartedAtRef.current) > MIN_SPEECH_MS;
     const withinSoft = (now - turnStartedAtRef.current) < SOFT_MS;
-    
     if (spokeLongEnough && currentQuestionIndex < totalQuestions - 1) {
-      console.log('🤖 Triggering auto-advance sequence (beta)...');
-      // Auto-advance is gated by a toggle; default off
-      const AUTO = false; // TODO: wire to UI toggle if desired
+      const AUTO = false; // stays opt-in
       if (!AUTO) return;
       speakAck();
-      // Tiny pause feels natural, longer pause for longer responses
       setTimeout(autoNext, withinSoft ? 300 : 0);
-    } else if (currentQuestionIndex >= totalQuestions - 1) {
-      console.log('🎉 At final question, skipping auto-advance');
-    } else {
-      console.log('⏱️ Response too short for auto-advance');
     }
   };
 
   const softNudge = () => {
+    if (mode !== 'structured') return;
     const now = performance.now();
     if (now - turnStartedAtRef.current > 60_000) {
-      // Only nudge if still speaking recently (within last 10s)
       const recentlySpoke = (now - lastSpeechAtRef.current) < 10_000;
-      if (recentlySpoke) {
-        console.log('🤖 Soft nudge: reminding about time limit');
-        // Use speakQuestion to ensure voice consistency
-        speakQuestion('Take your time—about twenty seconds left.');
-      }
+      if (recentlySpoke) speakQuestion('Take your time—about twenty seconds left.');
     }
   };
 
   const hardAdvance = () => {
-    console.log('⏰ Hard time limit reached, forcing advance');
-    // Respect same gating; hard cap still forces next silently
+    if (mode !== 'structured') return;
     setTimeout(() => autoNext(), 200);
   };
 
@@ -502,13 +548,8 @@ export default function InterviewClient() {
             }
           }
           
-          // Check for smart follow-up question
-          const followUp = rulesFollowup(t);
-          if (followUp) {
-            console.log('🤖 Smart follow-up detected:', followUp);
-            // Enqueue the follow-up question
-            setFollowUpQueue(prev => [...prev, followUp]);
-          }
+          // Generate AI insight after final answer
+          setTimeout(() => runInsight(t), 2000); // Debounced by 2s
           
           // Auto-advance after final transcript (only if not at last question)
           if (currentQuestionIndex < totalQuestions - 1) {
@@ -524,22 +565,18 @@ export default function InterviewClient() {
         () => {
           console.log('🔇 VAD-lite: Silence detected, finalizing partial and advancing...');
           
-          // Only process if we have partial text and not at last question
-          if (partial.trim() && currentQuestionIndex < totalQuestions - 1) { 
-            console.log('📝 Finalizing partial transcript from silence:', partial.substring(0, 50) + '...');
-            pushFinal(partial, Date.now()); 
-            setPartialLocal(''); 
-            
-            // Check for smart follow-up question
-            const followUp = rulesFollowup(partial);
-            if (followUp) {
-              console.log('🤖 Smart follow-up detected from partial:', followUp);
-              setFollowUpQueue(prev => [...prev, followUp]);
-            }
-            
-            // Auto-advance after processing partial
-            maybeAutoAdvance();
-          } else if (currentQuestionIndex >= totalQuestions - 1) {
+                  // Only process if we have partial text and not at last question
+        if (partial.trim() && currentQuestionIndex < totalQuestions - 1) { 
+          console.log('📝 Finalizing partial transcript from silence:', partial.substring(0, 50) + '...');
+          pushFinal(partial, Date.now()); 
+          setPartialLocal(''); 
+          
+          // Generate AI insight after final answer
+          setTimeout(() => runInsight(partial), 2000); // Debounced by 2s
+          
+          // Auto-advance after processing partial
+          maybeAutoAdvance();
+        } else if (currentQuestionIndex >= totalQuestions - 1) {
             console.log('🎉 At final question, skipping auto-advance from silence');
           } else {
             console.log('🔇 Silence detected but no partial text to process');
@@ -713,35 +750,16 @@ export default function InterviewClient() {
       const questionData: AddQuestionData = {
         question: {
           type: safeQuestionType as any,
-          source: 'scripted',
+          source: (mode === 'conversational' ? 'ai' : 'scripted') as any,
           text: questionText,
           rubricKey: safeQuestionType
         }
       };
 
       await InterviewService.addQuestion(firebaseSessionId, questionData);
-      console.log(`💾 Question saved to Firebase: ${questionText.substring(0, 50)}...`);
+      console.log(`💾 Question saved: ${questionText.substring(0, 50)}...`);
     } catch (error) {
       console.error('Failed to save question:', error);
-    }
-  };
-
-  // Save answer to Firebase
-  const saveAnswerToFirebase = async (questionId: string, answerText: string) => {
-    if (!firebaseSessionId) return;
-
-    try {
-      const answerData: AddAnswerData = {
-        answer: {
-          questionId,
-          transcriptRefs: [], // Will be linked to transcript segments
-          attachments: []
-        }
-      };
-
-      await InterviewService.addAnswer(firebaseSessionId, answerData);
-    } catch (error) {
-      console.error('Failed to save answer:', error);
     }
   };
 
@@ -751,174 +769,6 @@ export default function InterviewClient() {
   
   // Check if interview is completed
   const isInterviewCompleted = currentQuestionIndex >= totalQuestions - 1;
-
-  const nextQuestion = useCallback(() => {
-     if (currentQuestionIndex < totalQuestions - 1) {
-       // Save current question to Firebase before moving to next
-       const currentQuestion = getCurrentQuestion();
-       if (firebaseSessionId && currentQuestion.text) {
-         // Ensure category exists and is a string before calling toLowerCase()
-         const questionCategory = currentQuestion.category || 'behavioral';
-         // Fire-and-forget to avoid blocking UI thread
-         setTimeout(() => {
-           void saveQuestionToFirebase(currentQuestion.text, questionCategory.toLowerCase());
-         }, 0);
-       }
- 
-      // Move to the next question deterministically (+1)
-      const newIndex = Math.min(currentQuestionIndex + 1, totalQuestions - 1);
-      startTransition(() => {
-        setCurrentQuestionIndex(newIndex);
-      });
-      
-      // Add timeline event
-      if (firebaseSessionId) {
-        // Defer IO
-        setTimeout(() => {
-          void InterviewService.addTimelineEvent(firebaseSessionId, {
-            type: 'question_advanced',
-            data: { from: currentQuestionIndex, to: newIndex }
-          });
-        }, 0);
-      }
-      
-      console.log(`➡️ Advanced to question ${newIndex + 1}/${totalQuestions}`);
-      
-      // Get the question text from campaign questions or fallback to defaults
-      let nextQuestionText: string;
-      
-      if (campaignQuestions.length > 0 && newIndex < campaignQuestions.length) {
-        // Use campaign question
-        nextQuestionText = campaignQuestions[newIndex].text;
-        console.log(`📝 Using campaign question ${newIndex + 1}: ${nextQuestionText.substring(0, 50)}...`);
-      } else {
-        // Fallback to default questions
-        nextQuestionText = newIndex === 0 
-          ? 'Give me a 30-second overview of your background and experience.'
-          : newIndex === 1
-          ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
-          : newIndex === 2
-          ? 'Describe a challenging project you worked on and how you overcame obstacles.'
-          : newIndex === 3
-          ? 'Where do you see yourself professionally in the next 3-5 years?'
-          : newIndex === 4
-          ? 'What motivates you to do your best work?'
-          : newIndex === 5
-          ? 'Tell me about a time you had to learn something new quickly.'
-          : newIndex === 6
-          ? 'How do you handle feedback and criticism?'
-          : 'What questions do you have for me about this role or company?';
-        console.log(`📝 Using default question ${newIndex + 1}: ${nextQuestionText.substring(0, 50)}...`);
-      }
-      
-      // Speak the new question after a short delay to ensure state is updated
-      setTimeout(() => {
-        console.log(`🎤 Speaking question ${newIndex + 1}: ${nextQuestionText.substring(0, 50)}...`);
-        speakQuestion(nextQuestionText);
-      }, 160); // Slightly reduced delay for snappier feel while avoiding interruptions
-      
-      // If this is the last question, mark interview as completed
-      if (newIndex === totalQuestions - 1) {
-        console.log('🎉 Reached final question - interview will be marked as complete');
-        // Add completion timeline event
-        if (firebaseSessionId) {
-          setTimeout(() => {
-            void InterviewService.addTimelineEvent(firebaseSessionId!, {
-              type: 'final_question_reached',
-              data: { questionIndex: newIndex, totalQuestions }
-            });
-          }, 0);
-        }
-      }
-    } else {
-      console.log('🎉 Interview completed! All questions answered.');
-      // Add completion timeline event
-      if (firebaseSessionId) {
-        setTimeout(() => {
-          void InterviewService.addTimelineEvent(firebaseSessionId!, {
-            type: 'interview_completed',
-            data: { totalQuestions, completedAt: new Date().toISOString() }
-          });
-        }, 0);
-      }
-    }
-  }, [currentQuestionIndex, totalQuestions, firebaseSessionId, getCurrentQuestion, campaignQuestions]);
-
-  const previousQuestion = useCallback(() => {
-     if (currentQuestionIndex > 0) {
-       // Move to previous question
-      const newIndex = Math.max(currentQuestionIndex - 1, 0);
-       startTransition(() => {
-         setCurrentQuestionIndex(newIndex);
-       });
-       
-       // Add timeline event
-       if (firebaseSessionId) {
-         setTimeout(() => {
-           void InterviewService.addTimelineEvent(firebaseSessionId!, {
-             type: 'question_retreated',
-             data: { from: currentQuestionIndex, to: newIndex }
-           });
-         }, 0);
-       }
-       
-       console.log(`⬅️ Returned to question ${newIndex + 1}/${totalQuestions}`);
-       
-       // Get the question text from campaign questions or fallback to defaults
-       let previousQuestionText: string;
-       
-       if (campaignQuestions.length > 0 && newIndex < campaignQuestions.length) {
-         // Use campaign question
-         previousQuestionText = campaignQuestions[newIndex].text;
-         console.log(`📝 Using campaign question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
-       } else {
-         // Fallback to default questions
-         previousQuestionText = newIndex === 0 
-           ? 'Give me a 30-second overview of your background and experience.'
-           : newIndex === 1
-           ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
-           : newIndex === 2
-           ? 'Describe a challenging project you worked on and how you overcame obstacles.'
-           : newIndex === 3
-           ? 'Where do you see yourself professionally in the next 3-5 years?'
-           : newIndex === 4
-           ? 'What motivates you to do your best work?'
-           : newIndex === 5
-           ? 'Tell me about a time you had to learn something new quickly.'
-           : newIndex === 6
-           ? 'How do you handle feedback and criticism?'
-           : 'What questions do you have for me about this role or company?';
-         console.log(`📝 Using default question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
-       }
-       
-       // Speak the question after a short delay to ensure state is updated
-       setTimeout(() => {
-         console.log(`🎤 Speaking question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
-         speakQuestion(previousQuestionText);
-       }, 160);
-     }
-   }, [currentQuestionIndex, totalQuestions, campaignQuestions, firebaseSessionId, InterviewService]);
-
-  
-
-  const resetQuestions = useCallback(() => {
-    startTransition(() => {
-      setCurrentQuestionIndex(0);
-    });
-    
-    // Add timeline event
-    if (firebaseSessionId) {
-      setTimeout(() => {
-        void InterviewService.addTimelineEvent(firebaseSessionId!, {
-          type: 'questions_reset',
-          data: { to: 0 }
-        });
-      }, 0);
-    }
-    
-    // Note: Do NOT speak the question here - ControlsBar will handle it after reset
-    // This prevents duplicate speech calls
-  }, [firebaseSessionId]);
 
   // AI Voice function to speak questions
   const speakQuestion = async (questionText: string) => {
@@ -1018,6 +868,117 @@ export default function InterviewClient() {
     }
   };
 
+  // Seed a conversational session with a single intro question (AI-generated source)
+  useEffect(() => {
+    if (mode !== 'conversational') return;
+    if (!storeCurrentQ?.text) {
+      const seed = Math.random() < 0.5
+        ? 'Give me a 30-second overview of your background and experience.'
+        : 'What recent project are you most proud of, and why?';
+      enqueueFollowup(seed as any);
+    }
+  }, [mode, storeCurrentQ?.text, enqueueFollowup]);
+
+  // Speak the seed once it exists before STT is listening
+  useEffect(() => {
+    if (mode !== 'conversational') return;
+    if (storeCurrentQ?.text && !started) {
+      speakQuestion(storeCurrentQ.text);
+    }
+  }, [mode, storeCurrentQ?.text, started, speakQuestion]);
+
+  const nextQuestion = useCallback(() => {
+    if (clickBusy) return;
+    setClickBusy(true);
+    const done = () => setTimeout(() => setClickBusy(false), 120);
+  
+    const session = useSession.getState();
+    if (session.finished) { done(); return; }
+  
+    const isConversational = (mode === 'conversational');
+  
+    // Determine "current" (for logging / saving) BEFORE advancing
+    const current = isConversational
+      ? (storeCurrentQ || { text: '', category: 'behavioral' })
+      : getCurrentQuestion();
+  
+    // Persist the asked question to Firebase (source: ai vs scripted)
+    if (firebaseSessionId && current.text) {
+      const questionCategory = (current as any).category || 'behavioral';
+      void saveQuestionToFirebase(current.text, questionCategory.toLowerCase());
+    }
+  
+    // Advance ONE source of truth, depending on mode
+    if (isConversational) {
+      session.advance(); // consume the queued AI follow-up
+    } else {
+      setCurrentQuestionIndex(i => Math.min(i + 1, totalQuestions - 1));
+    }
+  
+    // Timeline event
+    if (firebaseSessionId) {
+      void InterviewService.addTimelineEvent(firebaseSessionId, {
+        type: 'question_advanced',
+        data: { from: currentQuestionIndex, to: isConversational ? session.qIndex : Math.min(currentQuestionIndex + 1, totalQuestions - 1) }
+      });
+    }
+  
+    // Speak the new question from the SAME source you just advanced
+    setTimeout(() => {
+      const qText = isConversational
+        ? useSession.getState().currentQ.text
+        : getCurrentQuestion().text;
+      console.log(`🎤 Speaking question: ${qText?.slice(0, 60)}...`);
+      speakQuestion(qText);
+    }, 160);
+  
+    if (session.finished && firebaseSessionId) {
+      void InterviewService.addTimelineEvent(firebaseSessionId, {
+        type: 'interview_completed',
+        data: { questionIndex: session.qIndex, totalQuestions }
+      });
+    }
+  
+    done();
+  }, [clickBusy, firebaseSessionId, currentQuestionIndex, totalQuestions, speakQuestion, mode, storeCurrentQ]);
+  
+  const previousQuestion = useCallback(() => {
+    if (mode !== 'structured') return; // conversational has no fixed back step
+    if (currentQuestionIndex <= 0) return;
+
+    const newIndex = Math.max(currentQuestionIndex - 1, 0);
+    startTransition(() => setCurrentQuestionIndex(newIndex));
+
+    if (firebaseSessionId) {
+      void InterviewService.addTimelineEvent(firebaseSessionId, {
+        type: 'question_retreated',
+        data: { from: currentQuestionIndex, to: newIndex }
+      });
+    }
+
+    const q = getCurrentQuestion();
+    setTimeout(() => speakQuestion(q.text), 160);
+  }, [mode, currentQuestionIndex, firebaseSessionId, getCurrentQuestion]);
+
+  const resetQuestions = useCallback(() => {
+    startTransition(() => {
+      setCurrentQuestionIndex(0);
+    });
+    
+    // Add timeline event
+    if (firebaseSessionId) {
+      setTimeout(() => {
+        void InterviewService.addTimelineEvent(firebaseSessionId!, {
+          type: 'questions_reset',
+          data: { to: 0 }
+        });
+      }, 0);
+    }
+    
+    // Note: Do NOT speak the question here - ControlsBar will handle it after reset
+    // This prevents duplicate speech calls
+  }, [firebaseSessionId]);
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900">
       <main className="max-w-7xl mx-auto p-6 space-y-8">
@@ -1088,14 +1049,19 @@ export default function InterviewClient() {
                 <h2 className="text-2xl font-bold text-white">Interview Controls</h2>
               </div>
               <div className="bg-white/5 rounded-2xl p-6 border border-white/10">
-                <ControlsBar 
-                  onStartSTT={startMic} 
-                  onStopSTT={stopMic} 
-                  onResetQuestions={resetQuestions}
-                  onSpeakQuestion={speakQuestion}
-                  onGetCurrentQuestion={() => getCurrentQuestion().text}
-                  deviceReady={deviceReady}
-                />
+              <ControlsBar
+  onStartSTT={startMic}
+  onStopSTT={stopMic}
+  onResetQuestions={resetQuestions}
+  onSpeakQuestion={speakQuestion}
+  onGetCurrentQuestion={() =>
+    mode === 'conversational'
+      ? (useSession.getState().currentQ.text ||
+         'Give me a 30-second overview of your background and experience.')
+      : getCurrentQuestion().text
+  }
+  deviceReady={deviceReady}
+/>
               </div>
                {/* Device check before starting */}
                {!started && (
@@ -1150,11 +1116,11 @@ export default function InterviewClient() {
           <div className="lg:col-span-5">
             <div className="animate-fade-in-up" style={{ animationDelay: '0.05s' }}>
               <AgentPane 
-                currentQuestion={getCurrentQuestion()}
+                currentQuestion={mode === 'conversational' ? { text: storeCurrentQ.text, category: (storeCurrentQ as any).category } : getCurrentQuestion()}
                 onNextQuestion={nextQuestion}
                 onPreviousQuestion={previousQuestion}
-                canGoNext={currentQuestionIndex < totalQuestions - 1}
-                canGoPrevious={currentQuestionIndex > 0}
+                canGoNext={mode === 'conversational' ? true : currentQuestionIndex < totalQuestions - 1}
+                canGoPrevious={mode === 'conversational' ? false : currentQuestionIndex > 0}
               />
             </div>
           </div>
@@ -1298,23 +1264,31 @@ export default function InterviewClient() {
               </div>
               
               <div className="mt-8 pt-8 border-t border-white/20">
-                <button
-                  onClick={() => {
-                    setCurrentQuestionIndex(0);
-                    setFirebaseSessionId(null);
-                    setTranscriptHistory([]);
-                    setPartialLocal('');
-                    lastSavedPartialRef.current = '';
-                    savedTranscriptsRef.current.clear();
-                    if (partialUpdateTimeoutRef.current) {
-                      clearTimeout(partialUpdateTimeoutRef.current);
-                      partialUpdateTimeoutRef.current = null;
-                    }
-                  }}
-                  className="bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white font-semibold px-8 py-4 rounded-2xl transition-all duration-300 hover:scale-105 shadow-lg"
-                >
-                  Start New Interview
-                </button>
+                <div className="flex gap-4 justify-center">
+                  <button
+                    onClick={generateFinalSummaryAndNavigate}
+                    className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 text-white font-semibold px-8 py-4 rounded-2xl transition-all duration-300 hover:scale-105 shadow-lg"
+                  >
+                    📊 Generate Final Report
+                  </button>
+                  <button
+                    onClick={() => {
+                      setCurrentQuestionIndex(0);
+                      setFirebaseSessionId(null);
+                      setTranscriptHistory([]);
+                      setPartialLocal('');
+                      lastSavedPartialRef.current = '';
+                      savedTranscriptsRef.current.clear();
+                      if (partialUpdateTimeoutRef.current) {
+                        clearTimeout(partialUpdateTimeoutRef.current);
+                        partialUpdateTimeoutRef.current = null;
+                      }
+                    }}
+                    className="bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white font-semibold px-8 py-4 rounded-2xl transition-all duration-300 hover:scale-105 shadow-lg"
+                  >
+                    Start New Interview
+                  </button>
+                </div>
               </div>
             </div>
           </div>

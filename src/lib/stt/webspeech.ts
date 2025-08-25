@@ -63,7 +63,7 @@ export function startSTT(
       try {
         // Detach handlers to avoid spurious onerror/onend after stop
         rec.onend = null as any;
-        rec.onerror = null as any;
+        (rec as any).onerror = null as any;
         rec.stop();
       } catch (e) {
         console.log('STT stop error (normal):', e);
@@ -94,7 +94,7 @@ export function startSTT(
     onSilence?.(); 
   };
   
-  rec.onerror = (event: any) => {
+  (rec as any).onerror = (event: any) => {
     // Web Speech API error event has different structure than standard Error
     let errorMessage = 'Unknown STT error';
     let errorCode = 'unknown';
@@ -148,10 +148,10 @@ export function startSTT(
   
   rec.start();
   
-  return () => { 
-    rec.onend = null; 
-    safeStop(); 
-    if (idle) clearTimeout(idle); 
+    return () => {
+    (rec as any).onend = null;
+    safeStop();
+    if (idle) clearTimeout(idle);
   };
 }
 

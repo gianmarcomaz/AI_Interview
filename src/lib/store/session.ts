@@ -1,8 +1,10 @@
 'use client';
 import { create } from 'zustand';
 import { Question, QUESTION_BANK, pickInitial, followupOrNext, pickNextDynamic } from '@/lib/fsm/agent';
+import { config } from '@/lib/config/env';
 
 export type Turn = { text: string; final: boolean; ts: number };
+export type ReportTranscript = { role: "user" | "ai"; text: string };
 
 // Function to load campaign questions from localStorage
 export const loadCampaignQuestions = (campaignId: string): Question[] => {
@@ -77,18 +79,25 @@ type State = {
   askedIds: string[];
   finished: boolean;
   // Day 2 additions (LLM insights)
-  llmMode: 'local'|'cloud'|'rules';
+  llmMode: 'cloud'|'rules';
   rollingSummary: string;
   lastInsight?: { schema_version: 1; turn_id: string; summary: string; tags: string[]; citations?: string[]; flags?: string[] };
   lastLatencyMs?: number;
   tagTally: Record<string, number>;
+  // AI interview system additions
+  tokensUsed: number;
+  softCap: number;
+  insights: any[];
+  finalSummary: any | null;
+  // Conversational follow-ups
+  followupQueue: string[];
   // Multilingual support
   ttsVoice?: string;
   // Consent gate
   consentAccepted: boolean;
   setCampaign(id?: string): void;
   setMode(m: 'structured'|'conversational'): void;
-  setLLMMode(m: 'local'|'cloud'|'rules'): void;
+  setLLMMode(m: 'cloud'|'rules'): void;
   setLang(lang: string): void;
   setTtsVoice(v?: string): void;
   setConsent(v: boolean): void;
@@ -97,10 +106,21 @@ type State = {
   setPartial(t: string): void;
   pushFinal(t: string, ts: number): void;
   updateRolling(): void;
-  next(): void;
   repeat(): void;
   setInsight(i: { schema_version: 1; turn_id: string; summary: string; tags: string[]; citations?: string[]; flags?: string[] }, latency: number): void;
+  // AI interview system actions
+  addTokens(n: number): void;
+  setFinalSummary(json: any): void;
+  enqueueFollowup(q: string): void;
+  dequeueFollowup(): string | undefined;
+  clearFollowups: () => void;
+  appendTranscript: (e: ReportTranscript) => void;
+  setTranscript: (tx: ReportTranscript[]) => void;
+  advance: () => void;
 };
+
+// Reentrancy guard for advancing to avoid double increments
+let __advancing = false;
 
 export const useSession = create<State>((set, get) => ({
   sessionId: '',
@@ -115,11 +135,19 @@ export const useSession = create<State>((set, get) => ({
   lastAnswer: undefined,
   askedIds: [],
   finished: false,
-  llmMode: 'local',
+  // Use a deterministic initial mode to avoid SSR/CSR mismatches
+  // We'll rely on runtime calls to flip to 'cloud' if successful and under budget
+  llmMode: 'rules',
   rollingSummary: '',
   lastInsight: undefined,
   lastLatencyMs: undefined,
   tagTally: {},
+  // AI interview system additions
+  tokensUsed: 0,
+  softCap: config.llm.softTokenCap,
+  insights: [],
+  finalSummary: null,
+  followupQueue: [],
   ttsVoice: undefined,
   consentAccepted: false,
 
@@ -142,46 +170,89 @@ export const useSession = create<State>((set, get) => ({
     const finals = get().transcript.filter(x=>x.final).slice(-3).map(t=>t.text);
     set({ rollingSummary: finals.join(' ') });
   },
-  next() {
-    const { lastAnswer, currentQ, qIndex, mode, askedIds } = get();
-    if (get().finished) return;
-    if (mode === 'conversational') {
-      // 2-turn policy per base question: Question -> optional Follow-up -> Next base
-      const isFollowup = /-f$/.test(currentQ.id);
-      const baseId = currentQ.id.replace(/(?:-f)+$/, '');
-      const hasAnswer = !!(lastAnswer && lastAnswer.trim().length > 0);
-      const short = !hasAnswer || (lastAnswer!.trim().length < 60 || lastAnswer!.split(/\s+/).length < 10);
-
-      // If short and not already a follow-up, ask one follow-up, then stop
-      if (short && !isFollowup) {
-        const updatedAsked = Array.from(new Set([ ...askedIds, baseId ]));
-        const nextQ: Question = { ...currentQ, id: baseId+'-f', text: 'Could you add concrete metrics or a specific example?' };
-        set({ currentQ: nextQ, lastAnswer: undefined, askedIds: updatedAsked });
-        return;
-      }
-
-      // Otherwise advance to the next unasked base question
-      const updatedAsked = Array.from(new Set([ ...askedIds, baseId ]));
-      const allAsked = updatedAsked.length >= QUESTION_BANK.length;
-      if (allAsked) { set({ finished: true, lastAnswer: undefined, askedIds: updatedAsked }); return; }
-      const nextBase = pickNextDynamic(hasAnswer ? lastAnswer : baseId, updatedAsked);
-      set({ currentQ: nextBase, lastAnswer: undefined, askedIds: updatedAsked });
-      return;
-    }
-    // structured
-    const { followup, question } = followupOrNext(lastAnswer, currentQ, qIndex);
-    const isLastIndex = qIndex >= QUESTION_BANK.length - 1;
-    if (!followup && isLastIndex) {
-      // End of deck
-      set({ finished: true, lastAnswer: undefined });
-      return;
-    }
-    set({ currentQ: question, qIndex: followup ? qIndex : Math.min(qIndex+1, 999), lastAnswer: undefined });
-  },
   repeat() { /* no state change; handled by TTS invoke in UI */ },
   setInsight(i, latency) {
     const tally = { ...get().tagTally };
     (i.tags || []).forEach(tag => { tally[tag] = (tally[tag] ?? 0) + 1; });
     set({ lastInsight: i, lastLatencyMs: latency, tagTally: tally });
+  },
+  // AI interview system actions
+  addTokens(n) {
+    set(s => ({ 
+      tokensUsed: s.tokensUsed + (n||0), 
+      llmMode: (s.tokensUsed + (n||0) >= s.softCap) ? "rules" : s.llmMode 
+    }));
+  },
+  setFinalSummary(json) {
+    set({ finalSummary: json });
+  },
+  enqueueFollowup(q) { set(s => ({ followupQueue: [...s.followupQueue, q] })); },
+  dequeueFollowup() {
+    const q = get().followupQueue[0];
+    if (!q) return undefined;
+    set(s => ({ followupQueue: s.followupQueue.slice(1) }));
+    return q;
+  },
+  clearFollowups: () => set({ followupQueue: [] }),
+  appendTranscript: (e: ReportTranscript) => set(s => ({ 
+    transcript: [...s.transcript, { text: e.text, final: e.role === "user", ts: Date.now() }] 
+  })),
+  setTranscript: (tx: ReportTranscript[]) => set({ 
+    transcript: tx.map(e => ({ text: e.text, final: e.role === "user", ts: Date.now() })) 
+  }),
+  advance: () => {
+    if (__advancing) return;
+    __advancing = true;
+    setTimeout(() => { __advancing = false; }, 300);
+
+    set((s) => {
+      if (s.finished) return s;
+
+      const { mode, lastAnswer, currentQ, qIndex, askedIds, followupQueue } = s;
+
+      if (mode === 'conversational') {
+        // Prioritize AI-generated follow-ups from the queue
+        if (followupQueue.length > 0) {
+          const nextFollowup = s.dequeueFollowup();
+          if (nextFollowup) {
+            const nextQ: Question = { 
+              ...currentQ, 
+              id: currentQ.id + '-ai-followup', 
+              text: nextFollowup 
+            };
+            return { currentQ: nextQ, lastAnswer: undefined };
+          }
+        }
+
+        // Fallback to existing conversational logic if no AI follow-ups
+        const isFollowup = /-f$/.test(currentQ.id);
+        const baseId = currentQ.id.replace(/(?:-f)+$/, '');
+        const hasAnswer = !!(lastAnswer && lastAnswer.trim().length > 0);
+        const short = !hasAnswer || (lastAnswer!.trim().length < 60 || lastAnswer!.split(/\s+/).length < 10);
+
+        // If short and not already a follow-up, ask one follow-up, then stop
+        if (short && !isFollowup) {
+          const updatedAsked = Array.from(new Set([ ...askedIds, baseId ]));
+          const nextQ: Question = { ...currentQ, id: baseId+'-f', text: 'Could you add concrete metrics or a specific example?' };
+          return { currentQ: nextQ, lastAnswer: undefined, askedIds: updatedAsked };
+        }
+
+        // Otherwise advance to the next unasked base question
+        const updatedAsked = Array.from(new Set([ ...askedIds, baseId ]));
+        const allAsked = updatedAsked.length >= QUESTION_BANK.length;
+        if (allAsked) { return { finished: true, lastAnswer: undefined, askedIds: updatedAsked }; }
+        const nextBase = pickNextDynamic(hasAnswer ? lastAnswer : baseId, updatedAsked);
+        return { currentQ: nextBase, lastAnswer: undefined, askedIds: updatedAsked };
+      }
+      
+      // structured: centralized advance with no double-increment on followups
+      const { followup, question } = followupOrNext(lastAnswer, currentQ, qIndex);
+      const isLastIndex = qIndex >= QUESTION_BANK.length - 1;
+      if (!followup && isLastIndex) {
+        return { finished: true, lastAnswer: undefined };
+      }
+      // If followup, do not increment base index
+      return { currentQ: question, qIndex: followup ? qIndex : qIndex + 1, lastAnswer: undefined };
+    });
   },
 }));

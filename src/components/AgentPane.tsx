@@ -64,7 +64,7 @@ export default function AgentPane({
         <button
           onClick={onPreviousQuestion}
           disabled={!canGoPrevious}
-          className={`px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center gap-2 ${
+          className={`px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center gap-2 active:scale-[0.98] ${
             canGoPrevious
               ? 'bg-blue-600 hover:bg-blue-700 text-white shadow-lg hover:shadow-xl'
               : 'bg-gray-600 text-gray-400 cursor-not-allowed'
@@ -77,7 +77,7 @@ export default function AgentPane({
         <button
           onClick={onNextQuestion}
           disabled={!canGoNext}
-          className={`px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center gap-2 ${
+          className={`px-4 py-2 rounded-lg font-medium transition-all duration-200 flex items-center gap-2 active:scale-[0.98] ${
             canGoNext
               ? 'bg-green-600 hover:bg-green-700 text-white shadow-lg hover:shadow-xl'
               : 'bg-gray-600 text-gray-400 cursor-not-allowed'

@@ -378,7 +378,24 @@ export class InterviewService {
   static async batchUpdateSession(sessionId: ID, updates: Partial<InterviewSession>): Promise<void> {
     await updateDoc(doc(this.getDb(), 'sessions', sessionId), updates);
   }
+  async getTranscriptSegments(sessionId: string) {
+    const { db } = getFirebase();
+    const q = query(
+      collection(db, 'sessions', sessionId, 'transcripts'),
+      orderBy('segment.tEnd', 'asc')
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map(d => d.data()?.segment).filter(Boolean) as Array<{
+      tStart:number; tEnd:number; textClean:string; speaker:string;
+    }>;
+  }
 
+  async getSessionSummary(sessionId: string) {
+    const { db } = getFirebase();
+    const sref = doc(db, 'sessions', sessionId);
+    const s = await getDoc(sref);
+    return s.exists() ? s.data() : null;
+  }
   // Get session statistics
   static async getSessionStats(sessionId: ID): Promise<{
     totalQuestions: number;
@@ -404,4 +421,5 @@ export class InterviewService {
       duration
     };
   }
+  
 }

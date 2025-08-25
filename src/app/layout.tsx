@@ -29,9 +29,12 @@ export default function RootLayout({
         <link rel="preconnect" href="https://firestore.googleapis.com" crossOrigin="anonymous" />
         <link rel="preconnect" href="https://www.gstatic.com" crossOrigin="anonymous" />
         <link rel="preconnect" href="https://www.googleapis.com" crossOrigin="anonymous" />
+        {/* Preconnect for LLM provider to reduce DNS/TLS on first click */}
+        <link rel="preconnect" href="https://api.openai.com" crossOrigin="anonymous" />
         <link rel="dns-prefetch" href="//firestore.googleapis.com" />
         <link rel="dns-prefetch" href="//www.gstatic.com" />
         <link rel="dns-prefetch" href="//www.googleapis.com" />
+        <link rel="dns-prefetch" href="//api.openai.com" />
       </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}

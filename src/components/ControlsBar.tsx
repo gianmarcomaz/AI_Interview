@@ -19,7 +19,13 @@ export default function ControlsBar({
   onGetCurrentQuestion?: () => string;
   deviceReady?: boolean;
 }) {
-  const { started, start, stop, lang, ttsVoice, consentAccepted, setConsent } = useSession();
+  // Narrow selector to avoid unnecessary re-renders
+  const started = useSession(s => s.started);
+  const start = useSession(s => s.start);
+  const stop = useSession(s => s.stop);
+  const ttsVoice = useSession(s => s.ttsVoice);
+  const consentAccepted = useSession(s => s.consentAccepted);
+  const setConsent = useSession(s => s.setConsent);
   const [showCountdown, setShowCountdown] = useState(false);
   const [countdown, setCountdown] = useState(3);
   const [mounted, setMounted] = useState(false);
@@ -193,7 +199,9 @@ export default function ControlsBar({
                   <span>•</span>
                   <span>Turns: 12</span>
                   <span>•</span>
-                  <span>Cost: $0 (local)</span>
+                  <span>Mode: {useSession.getState().llmMode}</span>
+                  <span>•</span>
+                  <span>Tokens: {useSession.getState().tokensUsed}/{useSession.getState().softCap}</span>
                 </div>
               </div>
             )}

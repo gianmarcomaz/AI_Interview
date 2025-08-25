@@ -1,120 +1,148 @@
 'use client';
-import { InsightSchema } from "@/lib/validate/schema";
-import { redactPII } from "@/lib/validate/safety";
-import { cosineSim } from "@/lib/validate/similarity";
-import { insightPrompt, retryPrompt, SCHEMA_JSON } from "@/lib/prompts/insight";
-import { localLLM } from "@/lib/llm/local";
-import { cloudLLM } from "@/lib/llm/cloud";
+import { InsightSchema, type Insight, SessionSummarySchema, type SessionSummary } from "../ai/schemas";
 
-export type Fact = { id: string; text: string };
-
-export async function generateInsight(opts:{
-  mode: "local"|"cloud"|"rules";
+export type InsightInput = {
+  mode: "cloud" | "rules";
   turnId: string;
   rollingSummary: string;
   snippet: string;
-  facts?: Fact[];
-}) {
-  const start = performance.now();
-  const snippetSafe = redactPII(opts.snippet);
+  facts: { id: string; text: string }[];
+  tokenBudgetLeft: number; // pass from store
+};
 
-  if (opts.mode === "rules") {
-    const summary = truncate20(snippetSafe);
-    const json = { schema_version:1 as const, turn_id: opts.turnId, summary, tags:["review"] };
-    const end = performance.now();
-    return { json, latency: end-start };
-  }
-
-  const prompt = insightPrompt({
-    rollingSummary: opts.rollingSummary,
-    snippet: snippetSafe,
-    facts: opts.facts,
-    schemaJson: SCHEMA_JSON
+async function callCloudJSON(system: string, user: string, max_tokens = 120) {
+  const res = await fetch("/api/llm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system, user, json: true, max_tokens })
   });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<{ text: string; usage?: { total_tokens: number } }>;
+}
 
-  const out = await (opts.mode === "local" ? localLLM(prompt) : cloudLLM(prompt));
+function rulesInsight(turnId: string, snippet: string, facts: {id:string;text:string}[]): Insight {
+  const s = snippet.trim();
+  const sum =
+    s.length < 40 ? "answer is brief; ask for a concrete example." :
+    /(\d|percent|%)/i.test(s) ? "mentions metrics; explore how impact was measured." :
+    "summarizes experience; probe for specific outcomes.";
+  const tags = Array.from(new Set(
+    [/latency|perf|cache/i.test(s) ? "performance" : null,
+     /system|scale|kafka|queue/i.test(s) ? "systems" : null,
+     /team|lead|mentor/i.test(s) ? "leadership" : null].filter(Boolean) as string[]
+  ));
+  const cites = facts.slice(0,2).map(f => f.id);
+  
+  // Enhanced follow-up logic for rules mode
+  const needsDepth = s.length < 60 || /general|generic|unsure/i.test(s);
+  const fu = needsDepth ? "Can you share a concrete example with numbers?" : undefined;
+  
+  return { schema_version: 1, turn_id: turnId, summary: sum.slice(0, 120), tags: tags.slice(0,3), citations: cites, followup: fu };
+}
 
-  const parsed = InsightSchema.safeParse(out);
-  const sumOk = parsed.success && withinCaps(parsed.data.summary);
-  const simOk = parsed.success && cosineSim(opts.snippet, parsed.data.summary) >= 0.70;
-  const citOk = ensureCitations(parsed.success ? parsed.data : undefined, opts.facts);
+export async function generateInsight(input: InsightInput): Promise<{ json: Insight; latency: number; usedTokens: number }> {
+  const { mode, turnId } = input;
+  const t0 = performance.now();
 
-  if (!(parsed.success && sumOk && simOk && citOk)) {
-    const retry = await (opts.mode==="local" ? localLLM(retryPrompt(prompt, opts.snippet)) : cloudLLM(retryPrompt(prompt, opts.snippet)));
-    const parsed2 = InsightSchema.safeParse(retry);
-    const sumOk2 = parsed2.success && withinCaps(parsed2.data.summary);
-    const simOk2 = parsed2.success && cosineSim(opts.snippet, parsed2.data.summary) >= 0.70;
-    const citOk2 = ensureCitations(parsed2.success ? parsed2.data : undefined, opts.facts);
-    if (parsed2.success && sumOk2 && simOk2 && citOk2) {
-      const end = performance.now();
-      return { json: parsed2.data, latency: end-start };
+  const snippet = (input.snippet || "").slice(-400);
+  const roll = (input.rollingSummary || "").slice(-240);
+  const facts = (input.facts || []).slice(0,3);
+  const factsBullets = facts.map(f => `- (${f.id}) ${f.text.slice(0,120)}`).join("\n");
+
+  if (mode === "rules" || input.tokenBudgetLeft <= 0) {
+    const json = rulesInsight(turnId, snippet, facts);
+    return { json, latency: performance.now() - t0, usedTokens: 0 };
+  }
+
+  const system = [
+    "You are an interview insight engine.",
+    "Return STRICT JSON only:",
+    "{ schema_version:1, turn_id:string, summary<=120, tags:string[<=3], citations?:string[<=3], followup?:string<=140 }",
+    "followup: at most ~15 words, only if the candidate's answer needs depth/clarity; otherwise omit.",
+  ].join("\n");
+
+  const user = [
+    `TURN: ${turnId}`,
+    `ROLLING_SUMMARY: ${roll}`,
+    `ANSWER_SNIPPET: ${snippet}`,
+    facts.length ? `FACTS:\n${factsBullets}` : "FACTS: (none)",
+    "Return JSON ONLY."
+  ].join("\n");
+
+  try {
+    const { text, usage } = await callCloudJSON(system, user, 120);
+    const parsed = InsightSchema.safeParse(JSON.parse(text));
+    if (!parsed.success) throw new Error("schema_fail");
+    return { json: parsed.data, latency: performance.now() - t0, usedTokens: usage?.total_tokens ?? 0 };
+  } catch {
+    // one retry with tighter instruction
+    try {
+      const { text, usage } = await callCloudJSON(system + "\nSTRICT: Do not include any text outside JSON.", user, 120);
+      const parsed = InsightSchema.safeParse(JSON.parse(text));
+      if (!parsed.success) throw new Error("schema_fail_2");
+      return { json: parsed.data, latency: performance.now() - t0, usedTokens: usage?.total_tokens ?? 0 };
+    } catch {
+      const json = rulesInsight(turnId, snippet, facts);
+      return { json, latency: performance.now() - t0, usedTokens: 0 };
     }
-    const end = performance.now();
-    return { json: { schema_version:1 as const, turn_id: opts.turnId, summary: "Needs human review", tags:["review"], flags:["format_fix"] }, latency: end-start };
   }
-
-  const end = performance.now();
-  return { json: parsed.data, latency: end-start };
 }
 
-// Simple rules-based follow-up suggestion; returns a single targeted prompt or null
-export function rulesFollowup(snippet: string): string | null {
-  const s = (snippet || '').toLowerCase();
-  if (!s || s.length < 10) return null;
-  
-  const hasNumber = /\d/.test(s);
-  const vague = s.split(/\s+/).length < 12 || /\b(thing|stuff|worked on|did|it|that)\b/.test(s);
-  const techMatch = s.match(/\b(node|react|python|java|aws|gcp|kubernetes|docker|sql|postgres|mongodb|redis|cache|latency|performance|scalability)\b/);
-  const hasMetrics = /\b(percent|%|users|requests|ms|seconds|hours|days|weeks|months|years)\b/.test(s);
-  const hasProcess = /\b(process|workflow|pipeline|system|architecture|design|implementation)\b/.test(s);
-  
-  // Priority-based follow-up selection
-  if (hasNumber && hasMetrics) {
-    return 'What drove that specific number? Can you walk me through the methodology?';
-  }
-  
-  if (techMatch) {
-    const tech = techMatch[0];
-    if (tech === 'cache' || tech === 'latency') {
-      return 'How did you measure the impact? What were your baseline metrics?';
-    }
-    return `How did you implement ${tech} in that project? What challenges did you face?`;
-  }
-  
-  if (hasProcess && vague) {
-    return 'Could you give me a concrete example of that process? What was your specific role?';
-  }
-  
-  if (vague) {
-    return 'Could you share a specific example with your role and the outcome?';
-  }
-  
-  if (s.includes('problem') || s.includes('challenge') || s.includes('issue')) {
-    return 'What was the root cause? How did you identify it?';
-  }
-  
-  if (s.includes('result') || s.includes('outcome') || s.includes('impact')) {
-    return 'How did you measure success? What were the key metrics?';
-  }
-  
-  return null;
-}
+// FINAL SESSION SUMMARY
 
-function withinCaps(s:string){ return s.length<=120 && s.trim().split(/\s+/).length<=20; }
+export async function generateFinalSummary(params: {
+  mode: "cloud" | "rules";
+  sessionId: string;
+  transcript: { role: "ai" | "user"; text: string }[];
+  insights: Insight[];
+  tokenBudgetLeft: number;
+}): Promise<{ json: SessionSummary; usedTokens: number }> {
+  const { mode, sessionId, transcript, insights, tokenBudgetLeft } = params;
+  if (mode === "rules" || tokenBudgetLeft <= 0) {
+    // simple rules summary
+    const all = transcript.filter(t => t.role === "user").map(t => t.text).join(" ");
+    const strengths = [/lead|mentor|owner/i.test(all) ? "leadership" : null,
+      /perf|latency|scal/i.test(all) ? "systems-performance" : null,
+      /ml|model|rag/i.test(all) ? "ml-rag" : null].filter(Boolean) as string[];
+    const risks = [all.length < 400 ? "brevity—probe for depth" : null].filter(Boolean) as string[];
+    const topics = Array.from(new Set(insights.flatMap(i => i.tags ?? []))).slice(0,8);
+    const json: SessionSummary = { schema_version: 1, session_id: sessionId, overview: "Interview completed; see strengths/risks.", strengths: strengths.slice(0,5), risks: risks.slice(0,5), topics };
+    return { json, usedTokens: 0 };
+  }
 
-function ensureCitations(data:any|undefined, facts?:Fact[]) {
-  if (!data) return false;
-  if (!facts || facts.length===0) return true;
-  if (!data.citations || !Array.isArray(data.citations)) return false;
-  const ids = new Set(facts.map(f=>f.id));
-  return data.citations.every((c:string)=>ids.has(c));
-}
+  const lastK = transcript.slice(-16).map(t => `${t.role.toUpperCase()}: ${t.text}`).join("\n").slice(-2000);
+  const tagsLine = Array.from(new Set(insights.flatMap(i => i.tags || []))).slice(0,8).join(", ");
 
-function truncate20(s:string){
-  const words = s.trim().split(/\s+/).slice(0,20);
-  let t = words.join(' ');
-  if (t.length>120) t = t.slice(0,120);
-  return t;
+  const system = [
+    "You are an interview summarizer. Return STRICT JSON only:",
+    "{ schema_version:1, session_id:string, overview:string<=600, strengths:string[<=5], risks:string[<=5], topics?:string[<=8] }",
+    "Summarize the candidate's performance, not the agent."
+  ].join("\n");
+
+  const user = [
+    `SESSION: ${sessionId}`,
+    `TAGS: ${tagsLine}`,
+    `TRANSCRIPT_LAST:`,
+    lastK,
+    "Return JSON ONLY."
+  ].join("\n");
+
+  const { text, usage } = await callCloudJSON(system, user, 240);
+  try {
+    const parsed = SessionSummarySchema.safeParse(JSON.parse(text));
+    if (!parsed.success) throw new Error("schema_fail");
+    return { json: parsed.data, usedTokens: usage?.total_tokens ?? 0 };
+  } catch {
+    // fallback rules
+    const all = transcript.filter(t => t.role === "user").map(t => t.text).join(" ");
+    const strengths = [/lead|mentor|owner/i.test(all) ? "leadership" : null,
+      /perf|latency|scal/i.test(all) ? "systems-performance" : null,
+      /ml|model|rag/i.test(all) ? "ml-rag" : null].filter(Boolean) as string[];
+    const risks = [all.length < 400 ? "brevity—probe for depth" : null].filter(Boolean) as string[];
+    const topics = Array.from(new Set(insights.flatMap(i => i.tags ?? []))).slice(0,8);
+    const json: SessionSummary = { schema_version: 1, session_id: sessionId, overview: "Interview completed; see strengths/risks.", strengths: strengths.slice(0,5), risks: risks.slice(0,5), topics };
+    return { json, usedTokens: 0 };
+  }
 }
 
 
