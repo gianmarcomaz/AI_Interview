@@ -290,6 +290,9 @@ export default function InterviewClient() {
       console.error('STT Error:', error);
       alert('Speech recognition not available. Please use Chrome browser.');
     }
+    
+    // Note: First question speaking is handled by ControlsBar after countdown
+    // No need to call speakQuestion here to avoid duplication
   };
 
   const stopMic = () => {
@@ -409,8 +412,11 @@ export default function InterviewClient() {
   };
 
   // Calculate interview progress
-  const completedQuestions = currentQuestionIndex;
   const totalQuestions = campaignQuestions.length > 0 ? campaignQuestions.length : 8;
+  const completedQuestions = currentQuestionIndex >= totalQuestions - 1 ? totalQuestions : currentQuestionIndex; // Show full completion when on last question
+  
+  // Check if interview is completed
+  const isInterviewCompleted = currentQuestionIndex >= totalQuestions - 1;
 
   const nextQuestion = () => {
     if (currentQuestionIndex < totalQuestions - 1) {
@@ -422,35 +428,124 @@ export default function InterviewClient() {
         saveQuestionToFirebase(currentQuestion.text, questionCategory.toLowerCase());
       }
 
-      setCurrentQuestionIndex(prev => prev + 1);
+      // Move to next question
+      const newIndex = currentQuestionIndex + 1;
+      setCurrentQuestionIndex(newIndex);
       
       // Add timeline event
       if (firebaseSessionId) {
         InterviewService.addTimelineEvent(firebaseSessionId, {
           type: 'question_advanced',
-          data: { from: currentQuestionIndex, to: currentQuestionIndex + 1 }
+          data: { from: currentQuestionIndex, to: newIndex }
         });
       }
       
-      console.log(`➡️ Advanced to question ${currentQuestionIndex + 1}/${totalQuestions}`);
+      console.log(`➡️ Advanced to question ${newIndex + 1}/${totalQuestions}`);
+      
+      // Get the question text from campaign questions or fallback to defaults
+      let nextQuestionText: string;
+      
+      if (campaignQuestions.length > 0 && newIndex < campaignQuestions.length) {
+        // Use campaign question
+        nextQuestionText = campaignQuestions[newIndex].text;
+        console.log(`📝 Using campaign question ${newIndex + 1}: ${nextQuestionText.substring(0, 50)}...`);
+      } else {
+        // Fallback to default questions
+        nextQuestionText = newIndex === 0 
+          ? 'Give me a 30-second overview of your background and experience.'
+          : newIndex === 1
+          ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
+          : newIndex === 2
+          ? 'Describe a challenging project you worked on and how you overcame obstacles.'
+          : newIndex === 3
+          ? 'Where do you see yourself professionally in the next 3-5 years?'
+          : newIndex === 4
+          ? 'What motivates you to do your best work?'
+          : newIndex === 5
+          ? 'Tell me about a time you had to learn something new quickly.'
+          : newIndex === 6
+          ? 'How do you handle feedback and criticism?'
+          : 'What questions do you have for me about this role or company?';
+        console.log(`📝 Using default question ${newIndex + 1}: ${nextQuestionText.substring(0, 50)}...`);
+      }
+      
+      // Speak the new question after a short delay to ensure state is updated
+      setTimeout(() => {
+        console.log(`🎤 Speaking question ${newIndex + 1}: ${nextQuestionText.substring(0, 50)}...`);
+        speakQuestion(nextQuestionText);
+      }, 200); // Increased delay to prevent TTS interruptions
+      
+      // If this is the last question, mark interview as completed
+      if (newIndex === totalQuestions - 1) {
+        console.log('🎉 Reached final question - interview will be marked as complete');
+        // Add completion timeline event
+        if (firebaseSessionId) {
+          InterviewService.addTimelineEvent(firebaseSessionId, {
+            type: 'final_question_reached',
+            data: { questionIndex: newIndex, totalQuestions }
+          });
+        }
+      }
     } else {
       console.log('🎉 Interview completed! All questions answered.');
+      // Add completion timeline event
+      if (firebaseSessionId) {
+        InterviewService.addTimelineEvent(firebaseSessionId, {
+          type: 'interview_completed',
+          data: { totalQuestions, completedAt: new Date().toISOString() }
+        });
+      }
     }
   };
 
   const previousQuestion = () => {
     if (currentQuestionIndex > 0) {
-      setCurrentQuestionIndex(prev => prev - 1);
+      // Move to previous question
+      const newIndex = currentQuestionIndex - 1;
+      setCurrentQuestionIndex(newIndex);
       
       // Add timeline event
       if (firebaseSessionId) {
         InterviewService.addTimelineEvent(firebaseSessionId, {
           type: 'question_retreated',
-          data: { from: currentQuestionIndex, to: currentQuestionIndex - 1 }
+          data: { from: currentQuestionIndex, to: newIndex }
         });
       }
       
-      console.log(`⬅️ Returned to question ${currentQuestionIndex - 1}/${totalQuestions}`);
+      console.log(`⬅️ Returned to question ${newIndex + 1}/${totalQuestions}`);
+      
+      // Get the question text from campaign questions or fallback to defaults
+      let previousQuestionText: string;
+      
+      if (campaignQuestions.length > 0 && newIndex < campaignQuestions.length) {
+        // Use campaign question
+        previousQuestionText = campaignQuestions[newIndex].text;
+        console.log(`📝 Using campaign question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
+      } else {
+        // Fallback to default questions
+        previousQuestionText = newIndex === 0 
+          ? 'Give me a 30-second overview of your background and experience.'
+          : newIndex === 1
+          ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
+          : newIndex === 2
+          ? 'Describe a challenging project you worked on and how you overcame obstacles.'
+          : newIndex === 3
+          ? 'Where do you see yourself professionally in the next 3-5 years?'
+          : newIndex === 4
+          ? 'What motivates you to do your best work?'
+          : newIndex === 5
+          ? 'Tell me about a time you had to learn something new quickly.'
+          : newIndex === 6
+          ? 'How do you handle feedback and criticism?'
+          : 'What questions do you have for me about this role or company?';
+        console.log(`📝 Using default question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
+      }
+      
+      // Speak the question after a short delay to ensure state is updated
+      setTimeout(() => {
+        console.log(`🎤 Speaking question ${newIndex + 1}: ${previousQuestionText.substring(0, 50)}...`);
+        speakQuestion(previousQuestionText);
+      }, 200); // Increased delay to prevent TTS interruptions
     }
   };
 
@@ -472,7 +567,7 @@ export default function InterviewClient() {
       text: currentQuestionIndex === 0 
         ? 'Give me a 30-second overview of your background and experience.'
         : currentQuestionIndex === 1
-        ? 'What are your key strengths and how have they helped you in your career?'
+        ? 'How would you keep p95 <1s in a live STT to summary pipeline?'
         : currentQuestionIndex === 2
         ? 'Describe a challenging project you worked on and how you overcame obstacles.'
         : currentQuestionIndex === 3
@@ -500,6 +595,89 @@ export default function InterviewClient() {
         type: 'questions_reset',
         data: { to: 0 }
       });
+    }
+    
+    // Note: Do NOT speak the question here - ControlsBar will handle it after reset
+    // This prevents duplicate speech calls
+  };
+
+  // AI Voice function to speak questions
+  const speakQuestion = (questionText: string) => {
+    if ('speechSynthesis' in window) {
+      // Stop any current speech gracefully
+      if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.cancel();
+        // Small delay to ensure clean stop
+        setTimeout(() => {
+          speakQuestionInternal(questionText);
+        }, 100);
+      } else {
+        speakQuestionInternal(questionText);
+      }
+    } else {
+      console.warn('⚠️ Speech synthesis not supported in this browser');
+    }
+  };
+
+  // Internal TTS function with proper error handling
+  const speakQuestionInternal = (questionText: string) => {
+    try {
+      const utterance = new SpeechSynthesisUtterance(questionText);
+      
+      // Get the selected TTS voice from the session store
+      const { ttsVoice } = useSession.getState();
+      
+      if (ttsVoice && ttsVoice !== 'default') {
+        // Find the specific voice
+        const voices = window.speechSynthesis.getVoices();
+        const selectedVoice = voices.find(v => v.voiceURI === ttsVoice);
+        if (selectedVoice) {
+          utterance.voice = selectedVoice;
+          console.log('🎤 Using selected TTS voice:', selectedVoice.name);
+        }
+      }
+      
+      // Configure speech parameters for clear interview questions
+      utterance.rate = 0.9; // Slightly slower for clarity
+      utterance.pitch = 1.0;
+      utterance.volume = 1.0;
+      
+      // Add event handlers with better error handling
+      utterance.onstart = () => {
+        console.log('🎤 AI speaking question:', questionText.substring(0, 50) + '...');
+      };
+      
+      utterance.onend = () => {
+        console.log('✅ AI finished speaking question');
+      };
+      
+      utterance.onerror = (event) => {
+        // Handle different error types gracefully
+        switch (event.error) {
+          case 'interrupted':
+            console.log('ℹ️ Speech was interrupted (this is normal when navigating quickly)');
+            break;
+          case 'canceled':
+            console.log('ℹ️ Speech was canceled (this is normal when stopping)');
+            break;
+          case 'not-allowed':
+            console.error('❌ Speech not allowed - check browser permissions');
+            break;
+          case 'network':
+            console.error('❌ Network error during speech synthesis');
+            break;
+          case 'audio-busy':
+            console.error('❌ Audio system is busy');
+            break;
+          default:
+            console.error('❌ TTS Error:', event.error);
+        }
+      };
+      
+      // Speak the question
+      window.speechSynthesis.speak(utterance);
+    } catch (error) {
+      console.error('❌ Error setting up TTS:', error);
     }
   };
 
@@ -576,7 +754,8 @@ export default function InterviewClient() {
               onStartSTT={startMic} 
               onStopSTT={stopMic} 
               onResetQuestions={resetQuestions}
-              currentQuestionText={getCurrentQuestion().text}
+              onSpeakQuestion={speakQuestion}
+              onGetCurrentQuestion={() => getCurrentQuestion().text}
             />
           </div>
           
@@ -656,6 +835,69 @@ export default function InterviewClient() {
             </div>
           </div>
         </div>
+
+        {/* Interview Completion Screen */}
+        {isInterviewCompleted && (
+          <div className="animate-fade-in-up" style={{ animationDelay: '0.7s' }}>
+            <div className="bg-gradient-to-r from-green-900/20 via-emerald-900/20 to-green-900/20 backdrop-blur-lg rounded-3xl border border-green-700/30 p-12 shadow-glow text-center">
+              <div className="w-24 h-24 bg-gradient-to-br from-green-500 to-emerald-600 rounded-full flex items-center justify-center mx-auto mb-8 animate-bounce">
+                <span className="text-white text-4xl">🎉</span>
+              </div>
+              
+              <h2 className="text-4xl font-bold text-white mb-4">Interview Completed!</h2>
+              <p className="text-green-200 text-xl mb-8 max-w-2xl mx-auto">
+                Congratulations! You have successfully completed all {totalQuestions} interview questions. 
+                Your responses have been recorded and saved for review.
+              </p>
+              
+              <div className="grid md:grid-cols-3 gap-6 max-w-4xl mx-auto">
+                <div className="bg-white/10 rounded-2xl p-6 border border-white/20">
+                  <div className="w-12 h-12 bg-blue-500/20 rounded-xl flex items-center justify-center mx-auto mb-4">
+                    <span className="text-blue-400 text-xl">📝</span>
+                  </div>
+                  <h3 className="text-white font-semibold text-lg mb-2">Transcript Saved</h3>
+                  <p className="text-blue-200 text-sm">All your responses have been transcribed and stored securely.</p>
+                </div>
+                
+                <div className="bg-white/10 rounded-2xl p-6 border border-white/20">
+                  <div className="w-12 h-12 bg-purple-500/20 rounded-xl flex items-center justify-center mx-auto mb-4">
+                    <span className="text-purple-400 text-xl">🎥</span>
+                  </div>
+                  <h3 className="text-white font-semibold text-lg mb-2">Video Recorded</h3>
+                  <p className="text-purple-200 text-sm">Your interview session has been captured for review.</p>
+                </div>
+                
+                <div className="bg-white/10 rounded-2xl p-6 border border-white/20">
+                  <div className="w-12 h-12 bg-green-500/20 rounded-xl flex items-center justify-center mx-auto mb-4">
+                    <span className="text-green-400 text-xl">✅</span>
+                  </div>
+                  <h3 className="text-white font-semibold text-lg mb-2">Session Complete</h3>
+                  <p className="text-green-200 text-sm">Your interview data is ready for evaluation.</p>
+                </div>
+              </div>
+              
+              <div className="mt-8 pt-8 border-t border-white/20">
+                <button
+                  onClick={() => {
+                    setCurrentQuestionIndex(0);
+                    setFirebaseSessionId(null);
+                    setTranscriptHistory([]);
+                    setPartialLocal('');
+                    lastSavedPartialRef.current = '';
+                    savedTranscriptsRef.current.clear();
+                    if (partialUpdateTimeoutRef.current) {
+                      clearTimeout(partialUpdateTimeoutRef.current);
+                      partialUpdateTimeoutRef.current = null;
+                    }
+                  }}
+                  className="bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white font-semibold px-8 py-4 rounded-2xl transition-all duration-300 hover:scale-105 shadow-lg"
+                >
+                  Start New Interview
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Enhanced Interview Tips */}
         <div className="bg-gradient-to-r from-white/10 via-white/5 to-white/10 backdrop-blur-lg rounded-3xl border border-white/20 p-8 shadow-glow animate-fade-in-up" style={{ animationDelay: '0.6s' }}>

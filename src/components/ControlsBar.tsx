@@ -1,19 +1,20 @@
 'use client';
 import { useState, useEffect } from 'react';
 import { useSession } from '@/lib/store/session';
-import { speak, cancelSpeak } from '@/lib/tts/say';
 import { Button } from '@/components/ui/button';
 
 export default function ControlsBar({ 
   onStartSTT, 
   onStopSTT, 
   onResetQuestions,
-  currentQuestionText
+  onSpeakQuestion,
+  onGetCurrentQuestion
 }: { 
   onStartSTT: () => void; 
   onStopSTT: () => void;
   onResetQuestions?: () => void;
-  currentQuestionText: string;
+  onSpeakQuestion?: (text: string) => void;
+  onGetCurrentQuestion?: () => string;
 }) {
   const { started, start, stop, lang, ttsVoice } = useSession();
   const [showCountdown, setShowCountdown] = useState(false);
@@ -30,22 +31,30 @@ export default function ControlsBar({
       setShowCountdown(false);
       start();
       onStartSTT();
-      
-      // Reset question index if function is provided
-      if (onResetQuestions) {
-        onResetQuestions();
-      }
-      
-      // Small delay to ensure everything is ready, then speak
+
+      // Small delay to ensure everything is ready, then speak the first question
       setTimeout(() => {
-        speak(currentQuestionText, lang, ttsVoice);
-      }, 500);
+        if (onSpeakQuestion && onGetCurrentQuestion) {
+          // Get the first question dynamically to ensure it matches the campaign questions
+          const firstQuestion = onGetCurrentQuestion();
+          console.log('🎤 ControlsBar speaking first question after countdown:', firstQuestion.substring(0, 50) + '...');
+          onSpeakQuestion(firstQuestion);
+        }
+      }, 500); // Increased delay to ensure question index is properly set
     }
-  }, [showCountdown, countdown, start, onStartSTT, currentQuestionText, lang, ttsVoice, onResetQuestions]);
+  }, [showCountdown, countdown, start, onStartSTT]);
   
   const handleStartInterview = () => {
     setShowCountdown(true);
     setCountdown(3);
+  };
+  
+  const handleRepeatQuestion = () => {
+    if (onSpeakQuestion && onGetCurrentQuestion) {
+      const currentQuestion = onGetCurrentQuestion();
+      console.log('🔄 Repeating current question:', currentQuestion.substring(0, 50) + '...');
+      onSpeakQuestion(currentQuestion);
+    }
   };
   
   return (
@@ -120,7 +129,6 @@ export default function ControlsBar({
             variant="destructive" 
             onClick={() => { 
               stop(); 
-              cancelSpeak(); 
               onStopSTT(); 
             }}
             size="xl"
@@ -132,10 +140,7 @@ export default function ControlsBar({
         )}
         
         <Button 
-          onClick={() => { 
-            cancelSpeak(); 
-            speak(currentQuestionText, lang, ttsVoice); 
-          }}
+          onClick={handleRepeatQuestion}
           variant="secondary"
           size="xl"
           cta="primary"
@@ -155,7 +160,7 @@ export default function ControlsBar({
               {started ? '🟢 Active' : '🔴 Inactive'}
             </div>
             <div className="text-xs text-blue-200/70 mt-1">
-              Voice: {ttsVoice ? 'Custom' : 'Auto'}
+              Voice: {ttsVoice ? 'Custom' : 'Default'}
             </div>
           </div>
         </div>

@@ -1,4 +1,5 @@
 'use client';
+import Link from 'next/link';
 import { useParams, useSearchParams } from 'next/navigation';
 import CSVUpload from '@/components/CSVUpload';
 import { useMemo, useState, useEffect } from 'react';
@@ -170,25 +171,28 @@ export default function CampaignDashboard() {
             </div>
           </div>
           {/* Navigation Links */}
-          <div className="mt-6 flex gap-3 justify-center">
-            <a 
-              href={`/chat/${id}`} 
-              className="h-10 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-medium hover:from-blue-700 hover:to-indigo-700 shadow-glow text-sm"
+          <div className="mt-6 flex flex-wrap justify-center gap-3">
+            <Link
+              href={`/chat/${id}`}
+              aria-label="Chat with your data"
+              className="h-10 px-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-medium hover:from-blue-700 hover:to-indigo-700 shadow-glow text-sm inline-flex items-center justify-center"
             >
               💬 Chat with your data
-            </a>
-            <a 
-              href={`/reports/demo123?c=${id}`} 
-              className="h-10 px-4 rounded-xl bg-gradient-to-r from-green-600 to-emerald-600 text-white font-medium hover:from-green-700 hover:to-emerald-700 shadow-glow text-sm"
+            </Link>
+            <Link
+              href={`/reports/demo123?c=${id}`}
+              aria-label="Reports"
+              className="h-10 px-4 rounded-xl bg-gradient-to-r from-green-600 to-emerald-600 text-white font-medium hover:from-green-700 hover:to-emerald-700 shadow-glow text-sm inline-flex items-center justify-center"
             >
               📄 Reports
-            </a>
-            <a 
-              href={`/campaign/${id}/outbound`} 
-              className="h-10 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white font-medium hover:from-purple-700 hover:to-fuchsia-700 shadow-glow text-sm"
+            </Link>
+            <Link
+              href={`/campaign/${id}/outbound`}
+              aria-label="Outbound (beta)"
+              className="h-10 px-4 rounded-xl bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white font-medium hover:from-purple-700 hover:to-fuchsia-700 shadow-glow text-sm inline-flex items-center justify-center"
             >
               📞 Outbound (beta)
-            </a>
+            </Link>
           </div>
         </section>
 
