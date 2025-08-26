@@ -16,7 +16,7 @@ import {
   writeBatch,
   arrayUnion
 } from 'firebase/firestore';
-import { getFirebase } from './client';
+import { getDb } from './client';
 import { 
   InterviewSession, 
   CreateInterviewSessionData,
@@ -47,8 +47,8 @@ export class InterviewService {
     return new Date().toISOString();
   }
 
-  private static getDb() {
-    return getFirebase().db;
+  private static getFirestoreDb() {
+    return getDb();
   }
 
   // Create a new interview session
@@ -81,7 +81,7 @@ export class InterviewService {
     };
 
     // Create the main session document
-    await setDoc(doc(this.getDb(), 'sessions', sessionId), session);
+    await setDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), session);
 
     // Add initial audit event
     await this.addAuditEvent(sessionId, {
@@ -98,7 +98,7 @@ export class InterviewService {
   // Get a session by ID
   static async getSession(sessionId: ID): Promise<InterviewSession | null> {
     try {
-      const docRef = doc(this.getDb(), 'sessions', sessionId);
+      const docRef = doc(this.getFirestoreDb(), 'sessions', sessionId);
       const docSnap = await getDoc(docRef);
       
       if (docSnap.exists()) {
@@ -119,7 +119,7 @@ export class InterviewService {
       ...(data.endedAt && { endedAt: data.endedAt })
     };
 
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), updateData);
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), updateData);
 
     // Add audit event
     await this.addAuditEvent(sessionId, {
@@ -140,7 +140,7 @@ export class InterviewService {
     };
 
     // Use arrayUnion to atomically add to transcripts array - NO RACE CONDITIONS
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       transcripts: arrayUnion(segment)
     });
 
@@ -166,7 +166,7 @@ export class InterviewService {
     };
 
     // Use arrayUnion to atomically add to questions array - NO RACE CONDITIONS
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       questions: arrayUnion(question)
     });
 
@@ -192,7 +192,7 @@ export class InterviewService {
     };
 
     // Use arrayUnion to atomically add to answers array - NO RACE CONDITIONS
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       answers: arrayUnion(answer)
     });
 
@@ -217,7 +217,7 @@ export class InterviewService {
     };
 
     // Use arrayUnion to atomically add to llmRuns array - NO RACE CONDITIONS
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       llmRuns: arrayUnion(run)
     });
 
@@ -235,7 +235,7 @@ export class InterviewService {
 
   // Update scoring
   static async updateScoring(sessionId: ID, data: UpdateScoringData): Promise<void> {
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       scoring: data.scoring
     });
 
@@ -251,7 +251,7 @@ export class InterviewService {
 
   // Update summary
   static async updateSummary(sessionId: ID, data: UpdateSummaryData): Promise<void> {
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       summary: data.summary
     });
 
@@ -273,7 +273,7 @@ export class InterviewService {
     };
 
     // Use arrayUnion to atomically add to audit.events array - NO RACE CONDITIONS
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       'audit.events': arrayUnion(event)
     });
   }
@@ -293,7 +293,7 @@ export class InterviewService {
     };
 
     // Use arrayUnion to atomically add to media.assets array - NO RACE CONDITIONS
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       'media.assets': arrayUnion(mediaRef)
     });
 
@@ -318,7 +318,7 @@ export class InterviewService {
     };
 
     // Use arrayUnion to atomically add to timeline array - NO RACE CONDITIONS
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), {
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), {
       timeline: arrayUnion(timelineEvent)
     });
   }
@@ -327,7 +327,7 @@ export class InterviewService {
   static async getSessionsByJob(jobId: ID): Promise<InterviewSession[]> {
     try {
       const q = query(
-        collection(this.getDb(), 'sessions'),
+        collection(this.getFirestoreDb(), 'sessions'),
         where('jobId', '==', jobId),
         orderBy('createdAt', 'desc')
       );
@@ -344,7 +344,7 @@ export class InterviewService {
   static async getSessionsByCandidate(candidateId: ID): Promise<InterviewSession[]> {
     try {
       const q = query(
-        collection(this.getDb(), 'sessions'),
+        collection(this.getFirestoreDb(), 'sessions'),
         where('candidateId', '==', candidateId),
         orderBy('createdAt', 'desc')
       );
@@ -360,10 +360,10 @@ export class InterviewService {
   // Delete session (for data retention compliance)
   static async deleteSession(sessionId: ID): Promise<void> {
     try {
-      await deleteDoc(doc(this.getDb(), 'sessions', sessionId));
+      await deleteDoc(doc(this.getFirestoreDb(), 'sessions', sessionId));
       
       // Add audit event to a separate audit collection before deletion
-      await addDoc(collection(this.getDb(), 'deleted_sessions_audit'), {
+      await addDoc(collection(this.getFirestoreDb(), 'deleted_sessions_audit'), {
         sessionId,
         deletedAt: this.getTimestamp(),
         reason: 'retention_policy'
@@ -376,23 +376,30 @@ export class InterviewService {
 
   // Batch update multiple fields
   static async batchUpdateSession(sessionId: ID, updates: Partial<InterviewSession>): Promise<void> {
-    await updateDoc(doc(this.getDb(), 'sessions', sessionId), updates);
+    await updateDoc(doc(this.getFirestoreDb(), 'sessions', sessionId), updates);
   }
-  async getTranscriptSegments(sessionId: string) {
-    const { db } = getFirebase();
-    const q = query(
-      collection(db, 'sessions', sessionId, 'transcripts'),
-      orderBy('segment.tEnd', 'asc')
-    );
-    const snap = await getDocs(q);
-    return snap.docs.map(d => d.data()?.segment).filter(Boolean) as Array<{
-      tStart:number; tEnd:number; textClean:string; speaker:string;
-    }>;
+  // Get transcript segments
+  static async getTranscriptSegments(sessionId: string) {
+    const sessionRef = doc(this.getFirestoreDb(), 'sessions', sessionId);
+    const sessionSnap = await getDoc(sessionRef);
+    
+    if (!sessionSnap.exists()) {
+      return [];
+    }
+    
+    const session = sessionSnap.data() as InterviewSession;
+    return session.transcripts
+      .sort((a, b) => a.tEnd - b.tEnd)
+      .map(segment => ({
+        tStart: segment.tStart,
+        tEnd: segment.tEnd,
+        textClean: segment.textClean,
+        speaker: segment.speaker
+      }));
   }
 
-  async getSessionSummary(sessionId: string) {
-    const { db } = getFirebase();
-    const sref = doc(db, 'sessions', sessionId);
+  static async getSessionSummary(sessionId: string) {
+    const sref = doc(this.getFirestoreDb(), 'sessions', sessionId);
     const s = await getDoc(sref);
     return s.exists() ? s.data() : null;
   }

@@ -5,7 +5,7 @@ import { useSearchParams, useParams } from 'next/navigation';
 import { useSession } from '@/lib/store/session';
 import { startSTT } from '@/lib/stt/webspeech';
 import { onSnapshot, doc, getDoc } from 'firebase/firestore';
-import { getFirebase } from '@/lib/firebase/client';
+import { logFirebaseProjectId, getDb } from '@/lib/firebase/client';
 
 import { useConversationalFlow } from '@/hooks/useConversationalFlow';
 
@@ -123,7 +123,10 @@ export default function InterviewClient({
     }
   }, [mode, sessionId]);
 
-
+  // Log Firebase project ID for debugging
+  useEffect(() => {
+    logFirebaseProjectId();
+  }, []);
 
   // Helper function to check TTS availability and permissions
   const checkTTSAvailability = useCallback(() => {
@@ -733,7 +736,7 @@ export default function InterviewClient({
     console.log('🎧 Setting up real-time transcript listener for session:', firebaseSessionId);
     
     try {
-      const { db } = getFirebase();
+      const db = getDb();
       
       // Create real-time listener for the session document to watch transcripts array
       const sessionDoc = doc(db, 'sessions', firebaseSessionId);
@@ -787,7 +790,7 @@ export default function InterviewClient({
         console.log('📚 Loading existing transcripts for session:', firebaseSessionId);
         
         // Get the session document to load existing transcripts
-        const { db } = getFirebase();
+        const db = getDb();
         const sessionDoc = doc(db, 'sessions', firebaseSessionId);
         const docSnapshot = await getDoc(sessionDoc);
         

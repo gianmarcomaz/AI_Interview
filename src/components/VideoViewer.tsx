@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useRef, useState } from "react";
 import { newPeer, attachStream, closePeer } from "@/lib/webrtc/rtc";
-import { getFirebase, signalingAvailable } from "@/lib/firebase/client";
+import { getDb, signalingAvailable } from "@/lib/firebase/client";
 import { callRef, getOffer, setAnswer, addIceCandidate, watchRemoteCandidates } from "@/lib/webrtc/signaling";
 
 type Props = { sessionId: string };
@@ -18,7 +18,7 @@ export default function VideoViewer({ sessionId }: Props) {
         setNote("Signaling not configured (Firebase). Viewer needs signaling.");
         return;
       }
-      const { db } = getFirebase();
+      const db = getDb();
       const ref = await callRef(db, sessionId);
       const offer = await getOffer(ref);
       if (!offer) { setNote("No publisher offer found. Ask the candidate to Go Live first."); return; }

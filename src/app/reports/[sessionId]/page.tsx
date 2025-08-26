@@ -5,7 +5,7 @@ import { useParams, useSearchParams } from "next/navigation";
 import {
   doc, getDoc, collection, getDocs, orderBy, query,
 } from "firebase/firestore";
-import { getFirebase } from "@/lib/firebase/client";
+import { getDb } from '@/lib/firebase/client';
 import { useSession } from "@/lib/store/session";
 import { generateFinalSummary } from "@/lib/orchestrator/insight";
 import ReportsClient from "./ReportsClient";
@@ -33,7 +33,7 @@ export default function ReportsPage() {
     }
   }, [routeSessionId]);
 
-  const { db } = getFirebase();
+  const db = getDb();
 
   const {
     setTranscript,

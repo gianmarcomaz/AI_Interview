@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useState } from 'react';
-import { getFirebase, signalingAvailable } from '@/lib/firebase/client';
+import { getDb, signalingAvailable } from '@/lib/firebase/client';
 import { doc, setDoc, deleteDoc } from 'firebase/firestore';
 
 export default function TestFirebase() {
@@ -44,7 +44,7 @@ export default function TestFirebase() {
         // Test Firebase connection
         if (hasSignaling) {
           try {
-            const { db } = getFirebase();
+            const db = getDb();
             results.push('✅ Firebase connection successful');
             
             // Test Firestore write

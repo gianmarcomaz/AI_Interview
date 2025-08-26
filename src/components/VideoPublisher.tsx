@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useRef, useState } from "react";
 import { newPeer, getCameraStream, getScreenStream, attachStream, stopStream, replaceVideoTrack, closePeer } from "@/lib/webrtc/rtc";
-import { getFirebase, signalingAvailable } from "@/lib/firebase/client";
+import { getDb, signalingAvailable } from "@/lib/firebase/client";
 import { callRef, setOffer, onAnswer, addIceCandidate, watchRemoteCandidates } from "@/lib/webrtc/signaling";
 import { Button } from "@/components/ui/button";
 import { InterviewService } from '@/lib/firebase/interview';
@@ -98,7 +98,7 @@ export default function VideoPublisher({ sessionId, firebaseSessionId }: VideoPu
         return;
       }
 
-      const { db } = getFirebase();
+      const db = getDb();
       console.log("Firebase connection established");
       
       const ref = await callRef(db, sessionId);
