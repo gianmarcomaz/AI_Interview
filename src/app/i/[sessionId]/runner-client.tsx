@@ -355,29 +355,34 @@ export default function InterviewClient({
       // Also enqueue this as the first follow-up
       enqueueFollowup(seed as any);
       console.log('🌱 Seeded initial conversational question:', seed);
+      
+      // FIXED: Ensure qIndex starts at 0 for the first question
+      if (session.qIndex !== 0) {
+        // Reset to initial state for conversational mode with the correct initial question
+        const initialQuestion = {
+          id: 'conversational-seed',
+          text: seed,
+          topic: 'behavioral' as const,
+          difficulty: 1 as const
+        };
+        session.start(initialQuestion);
+        console.log('🔄 Reset conversational progress to 0 with initial question:', seed.substring(0, 50) + '...');
+      }
     }
   }, [mode, enqueueFollowup, initialQuestionText]);
 
 
 
-  // Speak the seed once it exists before STT is listening
-  useEffect(() => {
-    if (mode !== 'conversational') return;
-    if (storeCurrentQ?.text && !started) {
-      speakQuestion(storeCurrentQ.text);
-    }
-  }, [mode, storeCurrentQ?.text, started, speakQuestion]);
+  // FIXED: Don't speak the seed here - ControlsBar will handle speaking the first question
+  // This prevents duplication when the first question is already spoken by ControlsBar
+  // useEffect(() => {
+  //   if (mode !== 'conversational') return;
+  //   if (storeCurrentQ?.text && !started) {
+  //     speakQuestion(storeCurrentQ.text);
+  //   }
+  // }, [mode, storeCurrentQ?.text, started, speakQuestion]);
 
-       // Reset conversational mode when switching modes
-     useEffect(() => {
-       if (mode === 'conversational') {
-         // Clear any existing questions and start fresh
-         useSession.getState().clearFollowups();
-         // Seed with initial question using props to ensure SSR/CSR consistency
-         const seed = initialQuestionText;
-         enqueueFollowup(seed as any);
-       }
-     }, [mode, enqueueFollowup, initialQuestionText]);
+       // FIXED: Removed duplicate useEffect that was causing initialization issues
 
   const [partial, setPartialLocal] = useState('');
   const [transcriptHistory, setTranscriptHistory] = useState<string[]>([]);
@@ -479,14 +484,27 @@ export default function InterviewClient({
         return;
       }
       
-      if (!transcript?.length) {
-        console.warn("No local transcript, fetching from server...");
+      // FIXED: Use Firebase transcripts as fallback if local transcript is empty
+      let source = transcript;
+      if (!source?.length && firebaseTranscripts?.length) {
+        source = firebaseTranscripts.map(t => ({
+          role: 'user' as const,
+          text: t.textClean || t.textRaw || '',
+          ts: t.tEnd || Date.now(),
+          final: true // Firebase transcripts are always final
+        }));
+        console.log('📝 Using Firebase transcripts as fallback:', source.length, 'segments');
+      }
+      
+      if (!source?.length) {
+        console.warn("No transcript available, navigating to reports page...");
         // Navigate to reports page where transcripts will be loaded from Firebase
         const reportUrl = `/reports/${sess}${campaignParam ? `?c=${campaignParam}` : ''}`;
         window.location.href = reportUrl;
         return;
       }
-      const transcriptData = transcript.map(t => ({ 
+      
+      const transcriptData = source.map(t => ({ 
         role: (t.final ? "user" : "ai") as "user" | "ai", 
         text: t.text 
       }));
@@ -556,33 +574,45 @@ export default function InterviewClient({
     }
   };
 
-  // --- Manual+ Half-duplex primitives ---
-
-  async function beep(ms = 120, freq = 880, vol = 0.03) {
+  // --- Audio primitives (shared context to avoid "Cannot close a closed AudioContext") ---
+  let SHARED_AUDIO_CTX: AudioContext | null = null;
+  function getAudioCtx(): AudioContext {
+    if (!SHARED_AUDIO_CTX || SHARED_AUDIO_CTX.state === 'closed') {
+      // Clean up any existing closed context
+      if (SHARED_AUDIO_CTX && SHARED_AUDIO_CTX.state === 'closed') {
+        SHARED_AUDIO_CTX = null;
+      }
+      // Create new context
+      try {
+        SHARED_AUDIO_CTX = new (window.AudioContext || (window as any).webkitAudioContext)();
+        console.log('🔊 New AudioContext created');
+      } catch (e) {
+        console.error('❌ Failed to create AudioContext:', e);
+        throw e;
+      }
+    }
+    return SHARED_AUDIO_CTX;
+  }
+  
+  // FIXED: One shared context, never close per beep
+  async function beep(ms = 120, freq = 660) {
     try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = freq;
-      gain.gain.value = vol;
-      osc.connect(gain).connect(ctx.destination);
-      osc.start();
-      setTimeout(() => { 
-        try { 
-          osc.stop(); 
-          // Only close if the context is not already closed and not suspended
-          if (ctx.state !== 'closed' && ctx.state !== 'suspended') {
-            ctx.close(); 
-          }
-        } catch (e) {
-          // Ignore any errors during cleanup
-          console.debug('Beep cleanup error (normal):', e);
-        } 
-      }, ms);
+      const ctx = getAudioCtx();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = 'sine';
+      o.frequency.value = freq;
+      o.connect(g);
+      g.connect(ctx.destination);
+      const now = ctx.currentTime;
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + ms / 1000);
+      o.start(now);
+      o.stop(now + ms / 1000);
+      await new Promise(r => setTimeout(r, ms));
     } catch (e) {
-      // Ignore any errors during beep creation
-      console.debug('Beep creation error (normal):', e);
+      console.debug('beep() skipped:', e);
     }
   }
 
@@ -596,30 +626,8 @@ export default function InterviewClient({
   // Auto-advance functionality with micro-acknowledgements
   const speakAck = async () => { await beep(100, 660); };
 
-  const autoNext = () => {
-    // Only auto-advance if we're in structured mode and not at the last question
-    if (mode === 'structured' && currentQuestionIndex < memoizedTotalQuestions - 1) {
-      console.log('🤖 Auto-advancing to next question...');
-      nextQuestion();
-    } else if (mode === 'conversational') {
-      console.log('💬 Conversational mode - no auto-advance, waiting for AI follow-up');
-    } else {
-      console.log('🎉 Interview completed, no more questions to advance to');
-    }
-  };
-
-  const maybeAutoAdvance = () => {
-    if (mode !== 'structured') return;  // conversational pace driven by AI followups
-    const now = performance.now();
-    const spokeLongEnough = (now - turnStartedAtRef.current) > MIN_SPEECH_MS;
-    const withinSoft = (now - turnStartedAtRef.current) < SOFT_MS;
-    if (spokeLongEnough && currentQuestionIndex < memoizedTotalQuestions - 1) {
-      const AUTO = false; // stays opt-in
-      if (!AUTO) return;
-      speakAck();
-      setTimeout(autoNext, withinSoft ? 300 : 0);
-    }
-  };
+  // FIXED: Removed auto-advance functions that were causing first question to be skipped
+  // Auto-advancement is now handled manually through the Next button
 
   const softNudge = () => {
     if (mode !== 'structured') return;
@@ -632,7 +640,8 @@ export default function InterviewClient({
 
   const hardAdvance = () => {
     if (mode !== 'structured') return;
-    setTimeout(() => autoNext(), 200);
+    // FIXED: No more auto-advancement - user must click Next button
+    console.log('🔇 Auto-advancement disabled - user must click Next to continue');
   };
 
   // Memoized current question getter (placed before handlers that depend on it)
@@ -684,8 +693,51 @@ export default function InterviewClient({
     };
     
     console.log(`📝 Structured mode - Default question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, defaultQuestion);
+    console.log(`🔍 getCurrentQuestion debug:`, {
+      currentQuestionIndex,
+      hasCampaignQuestions: campaignQuestions.length > 0,
+      usingCampaign: campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length,
+      usingDefault: !(campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length),
+      questionText: defaultQuestion.text.substring(0, 100),
+      initialQuestionText: initialQuestionText.substring(0, 100),
+      // Add more debugging
+      defaultQuestionsLength: defaultQuestions.length,
+      selectedQuestionIndex: defaultQuestions[currentQuestionIndex],
+      isFirstQuestion: currentQuestionIndex === 0
+    });
     return defaultQuestion;
   }, [campaignQuestions, currentQuestionIndex, mode, initialQuestionText]);
+
+  // FIXED: Stable getter for "question by index" (no stale reads)
+  const getQuestionAt = useCallback((idx: number) => {
+    if (mode === 'conversational') {
+      // in conv, UI is driven by session.currentQ; speaking is handled after advance()
+      return useSession.getState().currentQ;
+    }
+
+    // Campaign question list first
+    if (campaignQuestions.length > 0 && idx < campaignQuestions.length) {
+      const q = campaignQuestions[idx];
+      return { ...q, category: q.category || 'behavioral' };
+    }
+
+    // Default structured list (keep your existing defaults)
+    const defaults = [
+      initialQuestionText,
+      'How would you keep p95 <1s in a live STT to summary pipeline?',
+      'Describe a challenging project you worked on and how you overcame obstacles.',
+      'Where do you see yourself professionally in the next 3-5 years?',
+      'What motivates you to do your best work?',
+      'Tell me about a time you had to learn something new quickly.',
+      'How do you handle feedback and criticism?',
+      'What questions do you have for me about this role or company?',
+    ];
+    return {
+      id: `default-${idx + 1}`,
+      text: defaults[idx] || defaults[defaults.length - 1],
+      category: 'behavioral',
+    };
+  }, [mode, campaignQuestions, initialQuestionText]);
 
   // Initialize campaign + load saved campaign settings (lang, ttsVoice, questions)
   useEffect(() => {
@@ -695,6 +747,12 @@ export default function InterviewClient({
     if (campaignParam) {
       const questions = loadCampaignQuestions(campaignParam);
       console.log('📚 Loaded campaign questions:', questions);
+      console.log('🔍 Campaign question analysis:', {
+        hasQuestions: questions.length > 0,
+        firstQuestion: questions[0]?.text,
+        initialQuestionText: initialQuestionText,
+        textMatch: questions[0]?.text === initialQuestionText
+      });
       setCampaignQuestions(questions);
 
       // Load saved voice/language from campaign settings
@@ -745,14 +803,15 @@ export default function InterviewClient({
       if (partialUpdateTimeoutRef.current) {
         clearTimeout(partialUpdateTimeoutRef.current);
       }
-      if (vadStopRef.current) {
-        vadStopRef.current();
-      }
+      // FIXED: Make VAD stop idempotent and avoid hard closing
+      try { vadStopRef.current?.(); } catch {}
       // Cleanup transcript listener
       if (transcriptListener) {
         transcriptListener();
         setTranscriptListener(null);
       }
+      // FIXED: Do not hard-close AudioContext here; VAD uses suspend() and stop() is idempotent
+      // If you must hard-close, call hardCloseVadCtx() once globally
     };
   }, [transcriptListener]);
 
@@ -871,13 +930,16 @@ export default function InterviewClient({
     if (mode === 'conversational') {
       // For conversational mode, count based on session store's qIndex
       const sessionQIndex = useSession.getState().qIndex;
-      // Start from 0, not 1
+      // FIXED: Start from 0, not 1 - show actual questions completed
       return Math.min(sessionQIndex, 8); // Cap at 8 for conversational mode
     } else {
-      // For structured mode, use current question index
-      return currentQuestionIndex >= memoizedTotalQuestions - 1 ? memoizedTotalQuestions : currentQuestionIndex + 1;
+      // FIXED: For structured mode, completed questions = current question index + 1 (since we start at 0)
+      // When currentQuestionIndex = 0, we're on first question (1 completed)
+      // When currentQuestionIndex = 1, we're on second question (2 completed)
+      // When currentQuestionIndex = 7, we're on last question (8 completed)
+      return Math.min(currentQuestionIndex + 1, memoizedTotalQuestions);
     }
-  }, [currentQuestionIndex, memoizedTotalQuestions, mode, storeCurrentQ?.text]); // FIXED: Add storeCurrentQ dependency
+  }, [currentQuestionIndex, memoizedTotalQuestions, mode]);
 
   const memoizedIsInterviewCompleted = useMemo(() => {
     if (mode === 'conversational') {
@@ -885,10 +947,11 @@ export default function InterviewClient({
       const sessionQIndex = useSession.getState().qIndex;
       return sessionQIndex >= 8 || useSession.getState().finished;
     } else {
-      // For structured mode, check question index
+      // FIXED: For structured mode, interview is completed when we're at the last question
+      // currentQuestionIndex starts at 0, so last question is at memoizedTotalQuestions - 1
       return currentQuestionIndex >= memoizedTotalQuestions - 1;
     }
-  }, [currentQuestionIndex, memoizedTotalQuestions, mode, storeCurrentQ?.text]); // FIXED: Add storeCurrentQ dependency
+  }, [currentQuestionIndex, memoizedTotalQuestions, mode]);
 
   // Memoized current question to prevent unnecessary recalculations
   const currentQuestion = useMemo(() => {
@@ -907,8 +970,9 @@ export default function InterviewClient({
         category: 'behavioral'
       };
     } else {
-      // For structured mode, use the existing logic
-      const question = getCurrentQuestion();
+      // FIXED: For structured mode, use getQuestionAt with currentQuestionIndex
+      // This ensures we always get the correct question for the current index
+      const question = getQuestionAt(currentQuestionIndex);
       // Ensure the question has required properties
       if (question && question.text) {
         return {
@@ -916,14 +980,14 @@ export default function InterviewClient({
           category: question.category || 'behavioral'
         };
       }
-      // Fallback to initial question if getCurrentQuestion returns undefined
+      // Fallback to initial question if getQuestionAt returns undefined
       return {
         id: 'fallback-default',
         text: initialQuestionText,
         category: 'behavioral'
       };
     }
-  }, [mode, getCurrentQuestion, initialQuestionText]);
+  }, [mode, getQuestionAt, currentQuestionIndex, initialQuestionText]);
 
   // Memoized mode-dependent values
   const isConversationalMode = useMemo(() => mode === 'conversational', [mode]);
@@ -932,6 +996,8 @@ export default function InterviewClient({
       // In conversational mode, only allow next when not generating
       return !isGenerating;
     }
+    // FIXED: For structured mode, allow next when not at the last question
+    // currentQuestionIndex starts at 0, so last question is at memoizedTotalQuestions - 1
     return currentQuestionIndex < memoizedTotalQuestions - 1;
   }, [isConversationalMode, currentQuestionIndex, memoizedTotalQuestions, isGenerating]);
   const canGoPrevious = useMemo(() => 
@@ -1057,6 +1123,10 @@ export default function InterviewClient({
         sessionStartRef.current = Date.now();
       }
 
+      // FIXED: First question speaking is handled by ControlsBar after countdown
+      // No need to speak here to avoid duplication
+      // The first question will be spoken by ControlsBar when the countdown finishes
+      
       // Update Firebase session status to in_progress
       if (currentSessionId) {
         InterviewService.updateSessionStatus(currentSessionId, {
@@ -1104,6 +1174,19 @@ export default function InterviewClient({
         } catch (vadError) {
           console.warn('⚠️ VAD setup failed, falling back to basic STT:', vadError);
         }
+      }
+      
+      // FIXED: Speak the first question once per interview start (structured only)
+      if (mode === 'structured' && currentQuestionIndex === 0) {
+        const q0 = getQuestionAt(0);
+        setTimeout(() => {
+          try { 
+            console.log('🎤 Speaking first question after STT start:', q0.text.substring(0, 50) + '...');
+            speakQuestion(q0.text); 
+          } catch (e) { 
+            console.error('Failed to speak first question:', e); 
+          }
+        }, 200);
       }
       
       // Initialize turn timing
@@ -1184,10 +1267,8 @@ export default function InterviewClient({
           if (mode === 'conversational') {
             onAnswerFinalized(t);
           } else {
-            // Auto-advance after final transcript (only if not at last question)
-            if (currentQuestionIndex < memoizedTotalQuestions - 1) {
-              maybeAutoAdvance();
-            }
+            // FIXED: No more auto-advancement - user must click Next button
+            console.log('🔇 Auto-advancement disabled - user must click Next to continue');
           }
           
           // Clear timers since we got a final result
@@ -1201,7 +1282,7 @@ export default function InterviewClient({
           
           // FIXED: Only process if we have partial text and not at last question
           // Also ensure we don't stop transcription prematurely
-          if (partial.trim() && currentQuestionIndex < memoizedTotalQuestions - 1) { 
+          if (partial.trim() && currentQuestionIndex < memoizedTotalQuestions - 1 && transcript.length > 0) { 
             console.log('📝 Finalizing partial transcript from silence:', partial.substring(0, 50) + '...');
             pushFinal(partial, Date.now()); 
             setPartialLocal(''); 
@@ -1209,10 +1290,12 @@ export default function InterviewClient({
             // Generate AI insight after final answer
             setTimeout(() => runInsight(partial), 2000); // Debounced by 2s
             
-            // Auto-advance after processing partial
-            maybeAutoAdvance();
+            // FIXED: No more auto-advancement - user must click Next button
+            console.log('🔇 Auto-advancement disabled - user must click Next to continue');
           } else if (currentQuestionIndex >= memoizedTotalQuestions - 1) {
             console.log('🎉 At final question, skipping auto-advance from silence');
+          } else if (transcript.length === 0) {
+            console.log('🔇 Skipping auto-advance from silence - user hasn\'t answered first question yet');
           } else {
             console.log('🔇 Silence detected but no partial text to process');
           }
@@ -1333,6 +1416,12 @@ export default function InterviewClient({
 
     // Clear the session ID so the next Start creates a fresh session
     setFirebaseSessionId(null);
+    // FIXED: One shared AudioContext, never close per beep - just clear reference
+    if (SHARED_AUDIO_CTX && SHARED_AUDIO_CTX.state === 'closed') {
+      // If already closed, just clear the reference
+      SHARED_AUDIO_CTX = null;
+      console.log('🔇 AudioContext already closed, cleared reference');
+    }
   };
 
   // Optimized transcript saving with better debouncing
@@ -1418,6 +1507,7 @@ export default function InterviewClient({
     if (session.finished) { done(); return; }
   
     const isConversational = (mode === 'conversational');
+    const prevQIdx = session.qIndex; // capture before advancing
   
     // Current question (for logging) BEFORE advancing
     const current = isConversational
@@ -1453,42 +1543,41 @@ export default function InterviewClient({
           }
         });
       }
+      
+      // FIXED: Speak the new conversational question after advance()
+      setTimeout(() => {
+        try { speakQuestion(newQuestion.text); } catch (e) { console.error(e); }
+      }, 120);
     } else {
-      // For structured mode, increment the question index
-      startTransition(() => {
-        setCurrentQuestionIndex(i => Math.min(i + 1, memoizedTotalQuestions - 1));
-      });
+      // FIXED: For structured mode, compute next index first (avoid stale reads)
+      const nextIdx = Math.min(currentQuestionIndex + 1, memoizedTotalQuestions - 1);
+      const nextQ = getQuestionAt(nextIdx);
+      
+      // FIXED: Update the index FIRST, then use it for speech
+      startTransition(() => setCurrentQuestionIndex(nextIdx));
       
       // Timeline event for structured mode
       if (firebaseSessionId) {
         void InterviewService.addTimelineEvent(firebaseSessionId, {
           type: 'question_advanced',
-          data: {
-            from: currentQuestionIndex,
-            to: Math.min(currentQuestionIndex + 1, memoizedTotalQuestions - 1),
-            mode: 'structured'
-          }
+          data: { from: currentQuestionIndex, to: nextIdx, mode: 'structured' },
         });
       }
     }
   
     // FIXED: Speak the new question from the SAME source you advanced
+    // But don't speak if this is the first question (already spoken by ControlsBar)
     setTimeout(() => {
-      const qText = isConversational
-        ? useSession.getState().currentQ.text
-        : getCurrentQuestion().text;
-      
-      if (qText && qText.trim()) {
-        console.log('🎤 Speaking new question:', qText.substring(0, 50) + '...');
-        try {
-          speakQuestion(qText);
-        } catch (error) {
-          console.error('Failed to speak question:', error);
+      if (!isConversational) {
+        // FIXED: For structured mode, speak *exactly* what you'll display
+        const nextIdx = Math.min(currentQuestionIndex + 1, memoizedTotalQuestions - 1);
+        const nextQ = getQuestionAt(nextIdx);
+        if (nextQ && nextQ.text && nextQ.text.trim()) {
+          console.log('🎤 nextQuestion: Speaking new structured question:', nextQ.text.substring(0, 50) + '...');
+          try { speakQuestion(nextQ.text); } catch (error) { console.error('Failed to speak question:', error); }
         }
-      } else {
-        console.warn('⚠️ No question text to speak');
       }
-    }, 160);
+    }, 120);
   
     if (session.finished && firebaseSessionId) {
       void InterviewService.addTimelineEvent(firebaseSessionId, {
@@ -1498,13 +1587,15 @@ export default function InterviewClient({
     }
   
     done();
-  }, [clickBusy, firebaseSessionId, currentQuestionIndex, memoizedTotalQuestions, speakQuestion, mode, storeCurrentQ, getCurrentQuestion]);
+  }, [clickBusy, firebaseSessionId, currentQuestionIndex, memoizedTotalQuestions, speakQuestion, mode, storeCurrentQ, getCurrentQuestion, getQuestionAt]);
   
   const previousQuestion = useCallback(() => {
     if (mode !== 'structured') return; // conversational has no fixed back step
     if (currentQuestionIndex <= 0) return;
   
     const newIndex = Math.max(currentQuestionIndex - 1, 0);
+    
+    // FIXED: Update the index FIRST, then get the question for that index
     startTransition(() => setCurrentQuestionIndex(newIndex));
   
     if (firebaseSessionId) {
@@ -1514,9 +1605,10 @@ export default function InterviewClient({
       });
     }
   
-    const q = getCurrentQuestion();
+    // FIXED: Get the question for the new index, not the old one
+    const q = getQuestionAt(newIndex);
     setTimeout(() => speakQuestion(q.text), 160);
-  }, [mode, currentQuestionIndex, firebaseSessionId, getCurrentQuestion, speakQuestion]);
+  }, [mode, currentQuestionIndex, firebaseSessionId, getQuestionAt, speakQuestion]);
   
   const resetQuestions = useCallback(() => {
     startTransition(() => {
@@ -1609,6 +1701,26 @@ export default function InterviewClient({
     }
   }, [mode, storeCurrentQ?.text]);
 
+  // FIXED: Ensure currentQuestionIndex starts at 0 and doesn't get incremented prematurely
+  useEffect(() => {
+    // Ensure we always start at question 0 for new interviews
+    if (currentQuestionIndex !== 0 && !started) {
+      console.log('🔄 Resetting currentQuestionIndex to 0 for new interview');
+      setCurrentQuestionIndex(0);
+    }
+  }, [started, currentQuestionIndex]);
+
+  // DEBUG: Track currentQuestionIndex changes to identify premature advancement
+  useEffect(() => {
+    console.log('🔍 currentQuestionIndex changed:', {
+      from: 'unknown',
+      to: currentQuestionIndex,
+      started,
+      mode,
+      transcriptLength: transcript.length
+    });
+  }, [currentQuestionIndex, started, mode, transcript.length]);
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900">
       <main className="max-w-7xl mx-auto p-6 space-y-8">
@@ -1700,12 +1812,25 @@ export default function InterviewClient({
                   onStopSTT={stopMic}
                   onResetQuestions={resetQuestions}
                   onSpeakQuestion={speakQuestion}
-                  onGetCurrentQuestion={() =>
-                    mode === 'conversational'
-                      ? (useSession.getState().currentQ.text ||
+                  onGetCurrentQuestion={() => {
+                    const session = useSession.getState();
+                    const questionText = mode === 'conversational'
+                      ? (session.currentQ.text ||
                          'Give me a 30-second overview of your background and experience.')
-                      : getCurrentQuestion().text
-                  }
+                      : getQuestionAt(currentQuestionIndex).text;
+                    
+                    console.log('🔍 ControlsBar requesting current question:', {
+                      mode,
+                      questionText: questionText.substring(0, 100),
+                      sessionCurrentQ: session.currentQ.text?.substring(0, 100),
+                      sessionStarted: session.started,
+                      sessionQIndex: session.qIndex,
+                      currentQuestionIndex,
+                      getQuestionAtResult: getQuestionAt(currentQuestionIndex).text.substring(0, 100)
+                    });
+                    
+                    return questionText;
+                  }}
                   deviceReady={deviceReady}
                   // FIXED: Pass token information for display
                   tokensUsed={tokensUsed}

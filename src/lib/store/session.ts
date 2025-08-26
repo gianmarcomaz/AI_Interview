@@ -104,7 +104,7 @@ type State = {
   setTtsVoice(v?: string): void;
   setConsent(v: boolean): void;
   setDeviceChecked(v: boolean): void;
-  start(): void; 
+  start(initialQuestion?: Question): void; 
   stop(): void;
   setPartial(t: string): void;
   pushFinal(t: string, ts: number): void;
@@ -163,7 +163,18 @@ export const useSession = create<State>((set, get) => ({
   setTtsVoice(v) { set({ ttsVoice: v }); },
   setConsent(v) { set({ consentAccepted: v }); },
   setDeviceChecked(v) { set({ deviceChecked: v }); },
-  start() { set({ started: true, finished: false, qIndex: 0, askedIds: [], currentQ: pickInitial(), transcript: [], partial: '', lastAnswer: undefined }); },
+  start(initialQuestion?: Question) { 
+    set({ 
+      started: true, 
+      finished: false, 
+      qIndex: 0, 
+      askedIds: [], 
+      currentQ: initialQuestion || pickInitial(), 
+      transcript: [], 
+      partial: '', 
+      lastAnswer: undefined 
+    }); 
+  },
   stop() { set({ started: false, partial: '' }); },
   setPartial(t) { set({ partial: t }); },
   pushFinal(t, ts) {

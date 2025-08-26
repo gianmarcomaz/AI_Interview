@@ -81,11 +81,20 @@ export default function Home() {
 
             <div className="space-y-3">
               <Label className="text-white text-lg font-semibold">Interview Mode</Label>
-              <Select value={mode} onValueChange={(v: string) => setMode(v as 'structured'|'conversational')}>
-                <option value="">Select mode</option>
-                <option value="structured">📋 Structured - Fixed question sequence</option>
-                <option value="conversational">💬 Conversational - Dynamic follow-ups</option>
-              </Select>
+              <select 
+                value={mode} 
+                onChange={(e) => setMode(e.target.value as 'structured'|'conversational')}
+                className="form-input h-14 text-base w-full rounded-md"
+                style={{
+                  background: 'rgba(255, 255, 255, 0.1)',
+                  border: '1px solid rgba(255, 255, 255, 0.2)',
+                  color: 'white'
+                }}
+              >
+                <option value="" style={{ background: 'white', color: 'black' }}>Select mode</option>
+                <option value="structured" style={{ background: 'white', color: 'black' }}>📋 Structured - Fixed question sequence</option>
+                <option value="conversational" style={{ background: 'white', color: 'black' }}>💬 Conversational - Dynamic follow-ups</option>
+              </select>
               <p className="text-blue-200 text-base">
                 {mode === 'structured' 
                   ? 'Questions follow a predetermined order with optional follow-ups'

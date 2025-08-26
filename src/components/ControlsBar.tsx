@@ -1,5 +1,5 @@
 'use client';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useSession } from '@/lib/store/session';
 import { Button } from '@/components/ui/button';
@@ -47,6 +47,16 @@ export default function ControlsBar({
   const [countdown, setCountdown] = useState(3);
   const [mounted, setMounted] = useState(false);
   
+  // Ensure we only speak Q1 once per interview start
+  const hasSpokenQ1Ref = useRef(false);
+  
+  // Reset the Q1 speech flag when interview mode changes or when interview stops
+  useEffect(() => {
+    if (!started) {
+      hasSpokenQ1Ref.current = false;
+    }
+  }, [started]);
+  
   useEffect(() => {
     if (showCountdown && countdown > 0) {
       const timer = setTimeout(() => {
@@ -60,19 +70,57 @@ export default function ControlsBar({
       if ('speechSynthesis' in window) {
         window.speechSynthesis.getVoices();
       }
-      start();
+      
+      // Get the first question text before starting to ensure consistency
+      const firstQuestionText = onGetCurrentQuestion ? onGetCurrentQuestion() : '';
+      console.log('🔍 ControlsBar: About to start interview with question:', firstQuestionText.substring(0, 100));
+      
+      // Create the initial question object to pass to start()
+      const initialQuestion = {
+        id: 'q1',
+        text: firstQuestionText,
+        topic: 'intro' as const,
+        difficulty: 1 as const
+      };
+      
+      start(initialQuestion);
+      
       // Start STT after a short delay to avoid competing with first TTS
       setTimeout(() => onStartSTT(), 150);
 
       // Small delay to ensure everything is ready, then speak the first question
       setTimeout(() => {
-        if (onSpeakQuestion && onGetCurrentQuestion) {
+        if (onSpeakQuestion && onGetCurrentQuestion && !hasSpokenQ1Ref.current) {
           const firstQuestion = onGetCurrentQuestion();
           console.log('🎤 ControlsBar speaking first question after countdown:', firstQuestion.substring(0, 50) + '...');
+          console.log('🔍 ControlsBar: Full first question text:', firstQuestion);
+          
+          // Ensure we have a valid question text
+          if (!firstQuestion || !firstQuestion.trim()) {
+            console.error('❌ ControlsBar: No question text available from onGetCurrentQuestion');
+            return;
+          }
+          
           // Give voices a brief moment to load before first speak
-          setTimeout(() => onSpeakQuestion(firstQuestion), 250);
+          setTimeout(() => {
+            console.log('🎤 ControlsBar: Speaking first question (Q1) - this should only happen once');
+            try {
+              onSpeakQuestion(firstQuestion);
+              hasSpokenQ1Ref.current = true;
+              console.log('✅ ControlsBar: First question spoken, flag set to true');
+            } catch (error) {
+              console.error('❌ ControlsBar: Failed to speak first question:', error);
+              hasSpokenQ1Ref.current = false; // Reset flag on error so we can retry
+            }
+          }, 500); // Increased delay to ensure everything is ready
+        } else if (hasSpokenQ1Ref.current) {
+          console.log('🔇 ControlsBar: First question already spoken, skipping');
+        } else if (!onSpeakQuestion) {
+          console.error('❌ ControlsBar: onSpeakQuestion function not provided');
+        } else if (!onGetCurrentQuestion) {
+          console.error('❌ ControlsBar: onGetCurrentQuestion function not provided');
         }
-      }, 400);
+      }, 600); // Increased delay to ensure everything is ready
     }
   }, [showCountdown, countdown, start, onStartSTT]);
 
@@ -83,6 +131,8 @@ export default function ControlsBar({
   const handleStartInterview = () => {
     setShowCountdown(true);
     setCountdown(3);
+    // Reset the Q1 speech flag for new interview
+    hasSpokenQ1Ref.current = false;
   };
   
   const handleRepeatQuestion = () => {

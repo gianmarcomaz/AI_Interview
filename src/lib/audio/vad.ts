@@ -1,3 +1,13 @@
+// src/lib/audio/vad.ts
+let SHARED_VAD_CTX: AudioContext | null = null;
+
+function getVadCtx(): AudioContext {
+  if (!SHARED_VAD_CTX || SHARED_VAD_CTX.state === 'closed') {
+    SHARED_VAD_CTX = new (window.AudioContext || (window as any).webkitAudioContext)();
+  }
+  return SHARED_VAD_CTX;
+}
+
 export type VADCallbacks = {
   onSpeech?: () => void;
   onSilence?: () => void;
@@ -10,9 +20,17 @@ export function startVAD(stream: MediaStream, cb: VADCallbacks, opts?: {
   minSilenceMs?: number;
   energyThreshold?: number;     // 0..1 (RMS)
 }) {
-  const ac = new (window.AudioContext || (window as any).webkitAudioContext)();
-  const src = ac.createMediaStreamSource(stream);
-  const an = ac.createAnalyser();
+  const ctx = getVadCtx();
+  let stopped = false;
+
+  // (re)resume if suspended by a prior stop
+  if (ctx.state === 'suspended') {
+    // don't await—let it settle
+    ctx.resume().catch(() => {});
+  }
+
+  const src = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser();
   an.fftSize = opts?.fftSize ?? 1024;
   src.connect(an);
 
@@ -26,6 +44,8 @@ export function startVAD(stream: MediaStream, cb: VADCallbacks, opts?: {
   const thr = opts?.energyThreshold ?? 0.015;      // tune per mic
 
   const tick = () => {
+    if (stopped) return;
+    
     an.getFloatTimeDomainData(buf);               // time-domain samples (−1..1)
     // RMS energy
     let sum = 0;
@@ -42,5 +62,38 @@ export function startVAD(stream: MediaStream, cb: VADCallbacks, opts?: {
   };
 
   let raf = requestAnimationFrame(tick);
-  return () => { cancelAnimationFrame(raf); src.disconnect(); ac.close(); };
+  
+  const stop = async () => {
+    if (stopped) return;
+    stopped = true;
+
+    try { cancelAnimationFrame(raf); } catch {}
+    try { src.disconnect(); } catch {}
+    try { an.disconnect(); } catch {}
+
+    // Don't close the context here — it may be shared across features (beep, TTS cues, etc.)
+    // Just suspend it to free CPU; only a single owner (page unmount) should hard-close.
+    try {
+      if (SHARED_VAD_CTX && SHARED_VAD_CTX.state === 'running') {
+        await SHARED_VAD_CTX.suspend();
+      }
+    } catch {
+      // swallow – multiple stops are fine
+    }
+
+    // Also stop tracks you started for VAD (you *own* the stream here)
+    try {
+      stream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+    } catch {}
+  };
+
+  return stop;
+}
+
+// (Optional) one place in your app (page unload) may hard close:
+export async function hardCloseVadCtx() {
+  if (SHARED_VAD_CTX && SHARED_VAD_CTX.state !== 'closed') {
+    try { await SHARED_VAD_CTX.close(); } catch {}
+    SHARED_VAD_CTX = null;
+  }
 }
