@@ -17,24 +17,31 @@ const firebaseConfig = {
 };
 
 function assertFirebaseEnv() {
-  const required = [
-    "NEXT_PUBLIC_FIREBASE_API_KEY",
-    "NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN",
-    "NEXT_PUBLIC_FIREBASE_PROJECT_ID",
-    "NEXT_PUBLIC_FIREBASE_APP_ID",
-  ] as const;
+  // IMPORTANT: use direct property access so Next.js inlines values in the client bundle
+  const API_KEY     = process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
+  const AUTH_DOMAIN = process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN;
+  const PROJECT_ID  = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
+  const APP_ID      = process.env.NEXT_PUBLIC_FIREBASE_APP_ID;
 
-  const missing = required.filter(
-    (k) => !(process.env as any)[k] || String((process.env as any)[k]).trim() === ""
-  );
+  const missing: string[] = [];
+  if (!API_KEY || !API_KEY.trim())       missing.push("NEXT_PUBLIC_FIREBASE_API_KEY");
+  if (!AUTH_DOMAIN || !AUTH_DOMAIN.trim()) missing.push("NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN");
+  if (!PROJECT_ID || !PROJECT_ID.trim())  missing.push("NEXT_PUBLIC_FIREBASE_PROJECT_ID");
+  if (!APP_ID || !APP_ID.trim())         missing.push("NEXT_PUBLIC_FIREBASE_APP_ID");
 
   if (missing.length) {
-    const msg =
-      `[Firebase] Missing env: ${missing.join(
-        ", "
-      )}. Project ID empty causes Firestore paths like projects//... and breaks reads/writes.`;
-    // Surface loudly in both server and client
-    if (typeof window !== "undefined") console.error(msg, firebaseConfig);
+    const msg = `[Firebase] Missing env: ${missing.join(
+      ", "
+    )}. Project ID empty causes Firestore paths like projects//... and breaks reads/writes.`;
+    if (typeof window !== "undefined") {
+      // Optional: dump what we think config is (helps verify at runtime)
+      console.error(msg, {
+        apiKey: API_KEY,
+        authDomain: AUTH_DOMAIN,
+        projectId: PROJECT_ID,
+        appId: APP_ID,
+      });
+    }
     throw new Error(msg);
   }
 }
@@ -74,16 +81,15 @@ export function logFirebaseProjectId() {
 // - Safe on server and client
 // - Never throws; returns false if required envs are missing
 export function signalingAvailable(): boolean {
-  // SSR: check env presence only
+  // SSR: direct access is fine
+  const PROJECT_ID = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
+
   if (typeof window === "undefined") {
-    const pid = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
-    return typeof pid === "string" && pid.trim().length > 0;
+    return Boolean(PROJECT_ID && PROJECT_ID.trim());
   }
   try {
-    // Reuse same validation as getFirebase()
-    // If assertFirebaseEnv exists, call it; otherwise emulate the check
-    const pid = process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID;
-    if (!pid || !pid.trim()) throw new Error("missing projectId");
+    // On client, assert via direct properties (inlined by Next.js)
+    assertFirebaseEnv();
     return true;
   } catch {
     return false;
