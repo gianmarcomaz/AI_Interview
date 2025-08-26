@@ -1,20 +1,23 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 import { useSession } from '@/lib/store/session';
+import { startVAD } from '@/lib/audio/vad';
 
 interface DeviceCheckProps {
   onStatusChange?: (ready: boolean) => void;
 }
 
 export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
-  const { ttsVoice } = useSession();
   const [ok, setOk] = useState<boolean | null>(null);
-  const [level, setLevel] = useState(0);
   const [ttsTested, setTtsTested] = useState(false);
+  const [level, setLevel] = useState(0);
   const streamRef = useRef<MediaStream | null>(null);
+  const vadStopRef = useRef<(() => void) | null>(null);
   const rafRef = useRef<number | null>(null);
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  
+  // Get TTS voice from session store
+  const ttsVoice = useSession(s => s.ttsVoice);
+  const setTtsVoice = useSession(s => s.setTtsVoice);
 
   // Helper function to configure TTS with consistent voice settings
   const configureTTSVoice = (utterance: SpeechSynthesisUtterance) => {
@@ -49,22 +52,28 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
         streamRef.current = stream;
         setOk(true);
         
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const analyser = audioContext.createAnalyser();
-        const src = audioContext.createMediaStreamSource(stream);
-        src.connect(analyser);
-        const data = new Uint8Array(analyser.frequencyBinCount);
-        const loop = () => {
-          analyser.getByteTimeDomainData(data);
-          let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v; }
-          const rms = Math.sqrt(sum / data.length);
-          setLevel(Math.min(1, rms*4));
-          rafRef.current = requestAnimationFrame(loop);
-        };
-        loop();
+        // Use VAD for microphone level detection instead of creating our own AudioContext
+        const vadStop = startVAD(stream, {
+          onSpeech: () => {
+            // Update level when speech is detected
+            setLevel(0.8);
+          },
+          onSilence: () => {
+            // Update level when silence is detected
+            setLevel(0.1);
+          }
+        });
+        vadStopRef.current = vadStop;
         
-        // Store the audioContext for cleanup
-        audioContextRef.current = audioContext;
+        // Set initial level
+        setLevel(0.1);
+        
+        rafRef.current = requestAnimationFrame(() => {
+          // This frame is needed to ensure the VAD context is initialized
+          // and the first audio data is processed.
+          // The actual audio processing loop is handled by the VAD context.
+        });
+        
       } catch {
         setOk(false);
       }
@@ -72,15 +81,7 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       streamRef.current?.getTracks().forEach(t=>t.stop());
-      // Clean up AudioContext if it exists and is not closed
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed' && audioContextRef.current.state !== 'suspended') {
-        try {
-          audioContextRef.current.close();
-        } catch (e) {
-          // Ignore any errors during cleanup
-          console.debug('DeviceCheck AudioContext cleanup error (normal):', e);
-        }
-      }
+      vadStopRef.current?.();
     };
   }, []);
 
@@ -161,7 +162,6 @@ export default function DeviceCheck({ onStatusChange }: DeviceCheckProps) {
         </div>
       )}
       
-      <audio ref={audioRef} className="hidden" />
     </div>
   );
 }

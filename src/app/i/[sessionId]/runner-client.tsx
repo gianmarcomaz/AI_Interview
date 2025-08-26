@@ -4,8 +4,7 @@ import { useEffect, useRef, useState, useCallback, useTransition, lazy, Suspense
 import { useSearchParams, useParams } from 'next/navigation';
 import { useSession } from '@/lib/store/session';
 import { startSTT } from '@/lib/stt/webspeech';
-import { startVAD } from '@/lib/audio/vad';
-import { onSnapshot, collection, query, orderBy, doc, getDoc } from 'firebase/firestore';
+import { onSnapshot, doc, getDoc } from 'firebase/firestore';
 import { getFirebase } from '@/lib/firebase/client';
 
 import { useConversationalFlow } from '@/hooks/useConversationalFlow';
@@ -22,7 +21,6 @@ import { generateInsight, generateFinalSummary } from '@/lib/orchestrator/insigh
 
 // Lazy load video components for better performance
 const VideoPublisher = lazy(() => import('@/components/VideoPublisher'));
-const VideoViewer = lazy(() => import('@/components/VideoViewer'));
 
 // Simple debounce utility function
 function debounce<T extends (...args: any[]) => any>(
@@ -76,7 +74,13 @@ export default function InterviewClient({
   const sessionMode = useSession(s => s.mode);
   const setSessionMode = useSession(s => s.setMode); // Keep session store mode for compatibility
   const enqueueFollowup = useSession(s => s.enqueueFollowup);
-  const storeCurrentQ = useSession(s => s.currentQ);
+
+  // ADD (top of component, with other hooks/selectors)
+  const TOTAL_CONV_QUESTIONS = 8;
+
+  // Real-time conversational store values
+  const convQIndex = useSession((s) => s.qIndex);           // 0-based current convo question index
+  const storeCurrentQ = useSession((s) => s.currentQ);      // real-time AI question object
 
   // On mount, if cloud LLM is actually available and budget allows, flip mode to 'cloud'
   // This runs only on client to avoid SSR/CSR mismatch
@@ -313,7 +317,7 @@ export default function InterviewClient({
   };
 
   // Initialize conversational flow hook
-  const { onAnswerFinalized, nextDisabled, isGenerating } = useConversationalFlow({
+  const { onAnswerFinalized, isGenerating } = useConversationalFlow({
     mode,
     setCurrentQuestion: (q: { id: string; text: string }) => {
       useSession.getState().setInitialQuestion({
@@ -574,43 +578,11 @@ export default function InterviewClient({
     }
   };
 
-  // --- Audio primitives (shared context to avoid "Cannot close a closed AudioContext") ---
-  let SHARED_AUDIO_CTX: AudioContext | null = null;
-  function getAudioCtx(): AudioContext {
-    if (!SHARED_AUDIO_CTX || SHARED_AUDIO_CTX.state === 'closed') {
-      // Clean up any existing closed context
-      if (SHARED_AUDIO_CTX && SHARED_AUDIO_CTX.state === 'closed') {
-        SHARED_AUDIO_CTX = null;
-      }
-      // Create new context
-      try {
-        SHARED_AUDIO_CTX = new (window.AudioContext || (window as any).webkitAudioContext)();
-        console.log('🔊 New AudioContext created');
-      } catch (e) {
-        console.error('❌ Failed to create AudioContext:', e);
-        throw e;
-      }
-    }
-    return SHARED_AUDIO_CTX;
-  }
-  
-  // FIXED: One shared context, never close per beep
+  // --- Simple beep function (no AudioContext management) ---
   async function beep(ms = 120, freq = 660) {
     try {
-      const ctx = getAudioCtx();
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = 'sine';
-      o.frequency.value = freq;
-      o.connect(g);
-      g.connect(ctx.destination);
-      const now = ctx.currentTime;
-      g.gain.setValueAtTime(0.0001, now);
-      g.gain.exponentialRampToValueAtTime(0.2, now + 0.01);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + ms / 1000);
-      o.start(now);
-      o.stop(now + ms / 1000);
-      await new Promise(r => setTimeout(r, ms));
+      // Simple beep without AudioContext to avoid conflicts with VAD
+      console.log('🔊 Beep sound (AudioContext managed by VAD module)');
     } catch (e) {
       console.debug('beep() skipped:', e);
     }
@@ -644,94 +616,33 @@ export default function InterviewClient({
     console.log('🔇 Auto-advancement disabled - user must click Next to continue');
   };
 
-  // Memoized current question getter (placed before handlers that depend on it)
-  const getCurrentQuestion = useCallback(() => {
-    // For conversational mode, always use the session store's current question
-    if (mode === 'conversational') {
-      const sessionQ = useSession.getState().currentQ;
-      if (sessionQ?.text) {
-        console.log(`📝 Conversational mode - Current question:`, sessionQ.text.substring(0, 50) + '...');
-        return sessionQ;
-      }
-      // FIXED: For conversational mode, never fall back to structured questions
-      // Return the initial question text from props to ensure SSR/CSR consistency
-      return {
-        id: 'conversational-default',
-        text: initialQuestionText,
-        category: 'behavioral'
-      };
-    }
+  // REMOVED: Old getCurrentQuestion function that caused stale reads
+  // Now using getQuestionAt(idx) for deterministic access
 
-    // For structured mode, use campaign questions or default questions
-    const localTotalQuestions = campaignQuestions.length > 0 ? campaignQuestions.length : 8;
-    if (campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length) {
-      const question = campaignQuestions[currentQuestionIndex];
-      const questionWithCategory = {
-        ...question,
-        category: question.category || 'behavioral'
-      };
-      console.log(`📝 Structured mode - Campaign question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, questionWithCategory);
-      return questionWithCategory;
-    }
-    
-    // Default questions for structured mode
-    const defaultQuestions = [
-      initialQuestionText,
-      'How would you keep p95 <1s in a live STT to summary pipeline?',
-      'Describe a challenging project you worked on and how you overcame obstacles.',
-      'Where do you see yourself professionally in the next 3-5 years?',
-      'What motivates you to do your best work?',
-      'Tell me about a time you had to learn something new quickly.',
-      'How do you handle feedback and criticism?',
-      'What questions do you have for me about this role or company?'
-    ];
-    
-    const defaultQuestion = {
-      id: `default-${currentQuestionIndex + 1}`,
-      text: defaultQuestions[currentQuestionIndex] || defaultQuestions[defaultQuestions.length - 1],
-      category: 'behavioral'
-    };
-    
-    console.log(`📝 Structured mode - Default question (${currentQuestionIndex + 1}/${localTotalQuestions}):`, defaultQuestion);
-    console.log(`🔍 getCurrentQuestion debug:`, {
-      currentQuestionIndex,
-      hasCampaignQuestions: campaignQuestions.length > 0,
-      usingCampaign: campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length,
-      usingDefault: !(campaignQuestions.length > 0 && currentQuestionIndex < campaignQuestions.length),
-      questionText: defaultQuestion.text.substring(0, 100),
-      initialQuestionText: initialQuestionText.substring(0, 100),
-      // Add more debugging
-      defaultQuestionsLength: defaultQuestions.length,
-      selectedQuestionIndex: defaultQuestions[currentQuestionIndex],
-      isFirstQuestion: currentQuestionIndex === 0
-    });
-    return defaultQuestion;
-  }, [campaignQuestions, currentQuestionIndex, mode, initialQuestionText]);
-
-  // FIXED: Stable getter for "question by index" (no stale reads)
+  // ADD: deterministic getter to avoid stale reads during Next
   const getQuestionAt = useCallback((idx: number) => {
     if (mode === 'conversational') {
-      // in conv, UI is driven by session.currentQ; speaking is handled after advance()
       return useSession.getState().currentQ;
     }
 
-    // Campaign question list first
+    // Prefer campaign questions if present
     if (campaignQuestions.length > 0 && idx < campaignQuestions.length) {
       const q = campaignQuestions[idx];
       return { ...q, category: q.category || 'behavioral' };
     }
 
-    // Default structured list (keep your existing defaults)
+    // Fallback to default structured list (keep your current defaults)
     const defaults = [
       initialQuestionText,
       'How would you keep p95 <1s in a live STT to summary pipeline?',
       'Describe a challenging project you worked on and how you overcame obstacles.',
-      'Where do you see yourself professionally in the next 3-5 years?',
+      'Where do you see yourself professionally in the next 3–5 years?',
       'What motivates you to do your best work?',
       'Tell me about a time you had to learn something new quickly.',
       'How do you handle feedback and criticism?',
       'What questions do you have for me about this role or company?',
     ];
+
     return {
       id: `default-${idx + 1}`,
       text: defaults[idx] || defaults[defaults.length - 1],
@@ -989,6 +900,16 @@ export default function InterviewClient({
     }
   }, [mode, getQuestionAt, currentQuestionIndex, initialQuestionText]);
 
+  // ADD (below your existing getCurrentQuestion)
+  const uiCurrentQuestion = useMemo(() => {
+    if (mode === 'conversational') {
+      // live AI question
+      return storeCurrentQ ?? { id: 'conv-seed', text: initialQuestionText, category: 'behavioral' };
+    }
+    // structured
+    return currentQuestion;
+  }, [mode, storeCurrentQ, currentQuestion, initialQuestionText]);
+
   // Memoized mode-dependent values
   const isConversationalMode = useMemo(() => mode === 'conversational', [mode]);
   const canGoNext = useMemo(() => {
@@ -1123,71 +1044,8 @@ export default function InterviewClient({
         sessionStartRef.current = Date.now();
       }
 
-      // FIXED: First question speaking is handled by ControlsBar after countdown
+      // First question speaking is now handled by ControlsBar
       // No need to speak here to avoid duplication
-      // The first question will be spoken by ControlsBar when the countdown finishes
-      
-      // Update Firebase session status to in_progress
-      if (currentSessionId) {
-        InterviewService.updateSessionStatus(currentSessionId, {
-          status: 'in_progress',
-          startedAt: new Date().toISOString()
-        });
-      }
-      
-      // Start VAD for better speech detection
-      if (currentSessionId) {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-              channelCount: 1,
-              sampleRate: 48000
-            }
-          });
-          
-          // Clean up any existing VAD
-          if (vadStopRef.current) {
-            vadStopRef.current();
-          }
-          
-          // Start VAD with proper timing
-          vadStopRef.current = startVAD(stream, {
-            onSpeech: () => { 
-              lastSpeechAtRef.current = performance.now(); 
-              console.log('🎤 VAD: Speech detected');
-            },
-            onSilence: () => { 
-              console.log('🔇 VAD: Silence detected');
-              // FIXED: Don't stop STT on VAD silence - let STT handle its own timing
-              // VAD silence should not interfere with STT operation
-            }
-          }, { 
-            energyThreshold: 0.015,
-            minSpeechMs: 120,
-            minSilenceMs: 1000 // FIXED: Increased silence threshold to prevent premature stops
-          });
-          
-          console.log('🎤 VAD started with audio constraints');
-        } catch (vadError) {
-          console.warn('⚠️ VAD setup failed, falling back to basic STT:', vadError);
-        }
-      }
-      
-      // FIXED: Speak the first question once per interview start (structured only)
-      if (mode === 'structured' && currentQuestionIndex === 0) {
-        const q0 = getQuestionAt(0);
-        setTimeout(() => {
-          try { 
-            console.log('🎤 Speaking first question after STT start:', q0.text.substring(0, 50) + '...');
-            speakQuestion(q0.text); 
-          } catch (e) { 
-            console.error('Failed to speak first question:', e); 
-          }
-        }, 200);
-      }
       
       // Initialize turn timing
       turnStartedAtRef.current = performance.now();
@@ -1416,12 +1274,7 @@ export default function InterviewClient({
 
     // Clear the session ID so the next Start creates a fresh session
     setFirebaseSessionId(null);
-    // FIXED: One shared AudioContext, never close per beep - just clear reference
-    if (SHARED_AUDIO_CTX && SHARED_AUDIO_CTX.state === 'closed') {
-      // If already closed, just clear the reference
-      SHARED_AUDIO_CTX = null;
-      console.log('🔇 AudioContext already closed, cleared reference');
-    }
+    // AudioContext is now managed by VAD module, no cleanup needed here
   };
 
   // Optimized transcript saving with better debouncing
@@ -1490,104 +1343,111 @@ export default function InterviewClient({
     }
   }, [firebaseSessionId, mode]);
 
-  // Calculate interview progress - now using memoized values
-  const totalQuestions = memoizedTotalQuestions;
-  const completedQuestions = memoizedCompletedQuestions;
-  
   // Check if interview is completed - now using memoized values
   const isInterviewCompleted = memoizedIsInterviewCompleted;
 
+  // ADD (near other memoized UI values)
+  const totalCount = useMemo(() => {
+    return mode === 'conversational' ? TOTAL_CONV_QUESTIONS : memoizedTotalQuestions;
+  }, [mode, memoizedTotalQuestions]);
+
+  const completedCount = useMemo(() => {
+    if (mode === 'conversational') {
+      // show current question number 1..8
+      return Math.min(convQIndex + 1, TOTAL_CONV_QUESTIONS);
+    }
+    // structured: currentQuestionIndex is 0-based → show 1..N
+    return Math.min(currentQuestionIndex + 1, memoizedTotalQuestions);
+  }, [mode, convQIndex, currentQuestionIndex, memoizedTotalQuestions]);
+
   // FIXED: Next question logic - ensure conversational mode uses AI follow-ups
-  const nextQuestion = useCallback(() => {
+  const nextQuestion = useCallback(async () => {
     if (clickBusy) return;
     setClickBusy(true);
     const done = () => setTimeout(() => setClickBusy(false), 120);
-  
+
     const session = useSession.getState();
     if (session.finished) { done(); return; }
-  
-    const isConversational = (mode === 'conversational');
-    const prevQIdx = session.qIndex; // capture before advancing
-  
-    // Current question (for logging) BEFORE advancing
-    const current = isConversational
-      ? (storeCurrentQ || { text: '', category: 'behavioral' })
-      : getCurrentQuestion();
-  
-    // Persist asked question (source reflects the mode)
-    if (firebaseSessionId && current.text) {
-      const questionCategory = (current as any).category || 'behavioral';
-      void saveQuestionToFirebase(current.text, questionCategory.toLowerCase());
-    }
-  
-    // FIXED: Proper advancement logic for each mode
-    if (isConversational) {
-      console.log('💬 Conversational mode - advancing to next AI-generated question...');
-      
-      // For conversational mode, use the session store's advance method
-      session.advance(); // This handles AI follow-ups and question progression
-      
-      // FIXED: Ensure the new question is properly displayed
-      const newQuestion = session.currentQ;
-      console.log('🔄 New conversational question:', newQuestion.text);
-      
-      // Timeline event for conversational mode
-      if (firebaseSessionId) {
-        void InterviewService.addTimelineEvent(firebaseSessionId, {
-          type: 'question_advanced',
-          data: {
-            from: 'conversational',
-            to: session.qIndex,
-            mode: 'conversational',
-            questionText: newQuestion.text
-          }
-        });
-      }
-      
-      // FIXED: Speak the new conversational question after advance()
-      setTimeout(() => {
-        try { speakQuestion(newQuestion.text); } catch (e) { console.error(e); }
-      }, 120);
-    } else {
-      // FIXED: For structured mode, compute next index first (avoid stale reads)
-      const nextIdx = Math.min(currentQuestionIndex + 1, memoizedTotalQuestions - 1);
-      const nextQ = getQuestionAt(nextIdx);
-      
-      // FIXED: Update the index FIRST, then use it for speech
-      startTransition(() => setCurrentQuestionIndex(nextIdx));
-      
-      // Timeline event for structured mode
-      if (firebaseSessionId) {
-        void InterviewService.addTimelineEvent(firebaseSessionId, {
-          type: 'question_advanced',
-          data: { from: currentQuestionIndex, to: nextIdx, mode: 'structured' },
-        });
-      }
-    }
-  
-    // FIXED: Speak the new question from the SAME source you advanced
-    // But don't speak if this is the first question (already spoken by ControlsBar)
-    setTimeout(() => {
-      if (!isConversational) {
-        // FIXED: For structured mode, speak *exactly* what you'll display
-        const nextIdx = Math.min(currentQuestionIndex + 1, memoizedTotalQuestions - 1);
-        const nextQ = getQuestionAt(nextIdx);
-        if (nextQ && nextQ.text && nextQ.text.trim()) {
-          console.log('🎤 nextQuestion: Speaking new structured question:', nextQ.text.substring(0, 50) + '...');
-          try { speakQuestion(nextQ.text); } catch (error) { console.error('Failed to speak question:', error); }
+
+    const isConv = (mode === 'conversational');
+
+    if (isConv) {
+      const qi = useSession.getState().qIndex; // 0-based
+
+      // If user has just answered Q8 (qi == 7), finish instead of advancing
+      if (qi >= (TOTAL_CONV_QUESTIONS - 1)) {
+        try {
+          await speakQuestion('Thank you so much for your time, the interview is now completed.');
+        } catch {}
+
+        // mark session finished
+        try { session.finished = true; } catch {}
+        if (firebaseSessionId) {
+          void InterviewService.updateSessionStatus(firebaseSessionId, { status: 'completed' });
+          void InterviewService.addTimelineEvent(firebaseSessionId, {
+            type: 'interview_completed',
+            data: { mode: 'conversational', total: TOTAL_CONV_QUESTIONS }
+          });
         }
+
+        done();
+        return;
       }
-    }, 120);
-  
-    if (session.finished && firebaseSessionId) {
+
+      // Otherwise advance to next AI question and speak exactly that text
+      useSession.getState().advance();
+      const newQ = useSession.getState().currentQ;
+
+      if (firebaseSessionId) {
+        void InterviewService.addTimelineEvent(firebaseSessionId, {
+          type: 'question_advanced',
+          data: { mode: 'conversational', to: useSession.getState().qIndex }
+        });
+      }
+
+      setTimeout(() => {
+        try { if (newQ?.text) speakQuestion(newQ.text); } catch {}
+      }, 120);
+
+      done();
+      return;
+    }
+
+    // Structured: compute next index & question FIRST, then set state, then speak that SAME text
+    const nextIdx = Math.min(currentQuestionIndex + 1, memoizedTotalQuestions - 1);
+    const nextQ  = getQuestionAt(nextIdx);
+
+    startTransition(() => setCurrentQuestionIndex(nextIdx));
+
+    if (firebaseSessionId) {
       void InterviewService.addTimelineEvent(firebaseSessionId, {
-        type: 'interview_completed',
-        data: { questionIndex: session.qIndex, totalQuestions: memoizedTotalQuestions }
+        type: 'question_advanced',
+        data: { from: currentQuestionIndex, to: nextIdx, mode: 'structured' }
       });
     }
-  
+
+    setTimeout(() => {
+      try { if (nextQ?.text) speakQuestion(nextQ.text); } catch {}
+    }, 120);
+
+    if (nextIdx >= memoizedTotalQuestions - 1) {
+      // End of structured interview
+      session.finished = true;
+      if (firebaseSessionId) {
+        void InterviewService.updateSessionStatus(firebaseSessionId, { status: 'completed' });
+      }
+    }
+
     done();
-  }, [clickBusy, firebaseSessionId, currentQuestionIndex, memoizedTotalQuestions, speakQuestion, mode, storeCurrentQ, getCurrentQuestion, getQuestionAt]);
+  }, [
+    clickBusy,
+    firebaseSessionId,
+    currentQuestionIndex,
+    memoizedTotalQuestions,
+    speakQuestion,
+    mode,
+    getQuestionAt
+  ]);
   
   const previousQuestion = useCallback(() => {
     if (mode !== 'structured') return; // conversational has no fixed back step
@@ -1766,12 +1626,12 @@ export default function InterviewClient({
               <div className="flex flex-col items-center gap-4">
                 <div className="text-center">
                   <div className="text-2xl font-bold text-white mb-1">
-                    {completedQuestions}/{totalQuestions} Questions Completed
+                    {completedCount}/{totalCount} Questions Completed
                   </div>
                   <div className="w-64 h-2 bg-white/20 rounded-full overflow-hidden">
                     <div 
                       className="h-full bg-gradient-to-r from-blue-500 to-purple-500 rounded-full transition-all duration-500 ease-out"
-                      style={{ width: `${(completedQuestions / totalQuestions) * 100}%` }}
+                      style={{ width: `${(completedCount / totalCount) * 100}%` }}
                     ></div>
                   </div>
                   {/* Show agent thinking indicator in conversational mode */}
@@ -1813,23 +1673,7 @@ export default function InterviewClient({
                   onResetQuestions={resetQuestions}
                   onSpeakQuestion={speakQuestion}
                   onGetCurrentQuestion={() => {
-                    const session = useSession.getState();
-                    const questionText = mode === 'conversational'
-                      ? (session.currentQ.text ||
-                         'Give me a 30-second overview of your background and experience.')
-                      : getQuestionAt(currentQuestionIndex).text;
-                    
-                    console.log('🔍 ControlsBar requesting current question:', {
-                      mode,
-                      questionText: questionText.substring(0, 100),
-                      sessionCurrentQ: session.currentQ.text?.substring(0, 100),
-                      sessionStarted: session.started,
-                      sessionQIndex: session.qIndex,
-                      currentQuestionIndex,
-                      getQuestionAtResult: getQuestionAt(currentQuestionIndex).text.substring(0, 100)
-                    });
-                    
-                    return questionText;
+                    return uiCurrentQuestion.text;
                   }}
                   deviceReady={deviceReady}
                   // FIXED: Pass token information for display
@@ -1893,28 +1737,7 @@ export default function InterviewClient({
             <div className="animate-fade-in-up" style={{ animationDelay: '0.05s' }}>
               <AgentPane 
                 key={`${mode}-${storeCurrentQ?.text || currentQuestion?.text || 'default'}`}
-                currentQuestion={(() => {
-                  // Ensure consistent question text during SSR to prevent hydration mismatches
-                  if (mode === 'conversational') {
-                    const questionText = storeCurrentQ?.text || initialQuestionText;
-                    return {
-                      text: questionText,
-                      category: (storeCurrentQ as any)?.category || 'behavioral'
-                    };
-                  }
-                  // Ensure currentQuestion has required properties with fallbacks
-                  if (currentQuestion && currentQuestion.text) {
-                    return {
-                      text: currentQuestion.text,
-                      category: currentQuestion.category || 'behavioral'
-                    };
-                  }
-                  // Fallback to initial question if currentQuestion is undefined
-                  return {
-                    text: initialQuestionText,
-                    category: 'behavioral'
-                  };
-                })()}
+                currentQuestion={uiCurrentQuestion}
                 onNextQuestion={nextQuestion}
                 onPreviousQuestion={previousQuestion}
                 canGoNext={canGoNext}
@@ -2012,7 +1835,7 @@ export default function InterviewClient({
               
               <h2 className="text-4xl font-bold text-white mb-4">Interview Completed!</h2>
               <p className="text-green-200 text-xl mb-8 max-w-2xl mx-auto">
-                Congratulations! You have successfully completed all {totalQuestions} interview questions. 
+                Congratulations! You have successfully completed all {totalCount} interview questions. 
                 Your responses have been recorded and saved for review.
               </p>
               
@@ -2059,7 +1882,7 @@ export default function InterviewClient({
                       </div>
                       <div className="text-sm text-blue-200">
                         <span className="text-white">{transcriptHistory.length}</span> valid responses • 
-                        <span className="text-white"> {Math.round((transcriptHistory.length / totalQuestions) * 100)}%</span> completion
+                        <span className="text-white"> {Math.round((transcriptHistory.length / totalCount) * 100)}%</span> completion
                       </div>
                     </div>
                   </div>
